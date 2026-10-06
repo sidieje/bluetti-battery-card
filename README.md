@@ -11,7 +11,7 @@ Delta, Anker Solix, etc.).
    [ DC   ] ----'           '---- [ AC   ]
 ```
 
-Four corner nodes for the two inputs (PV, Grid) and two outputs (DC, AC), with
+Four corner nodes for PV input, bidirectional Grid power, and two outputs (DC, AC), with
 a semicircular state-of-charge gauge in the middle. Flow lines from each corner
 animate when their input/output is active; their speed scales with wattage.
 
@@ -24,8 +24,8 @@ The existing power-flow cards model the wrong topology for an integrated UPS:
 - **`enhanced-power-flow-card`** assumes a Victron-style split inverter/charger
   where the inverter is a separate hub from the battery.
 
-A portable power station is **neither**. It's a single integrated unit with two
-inputs (grid, solar) and two outputs (DC, AC). The battery, inverter, charger,
+A portable power station is **neither**. It's a single integrated unit with PV input,
+bidirectional Grid power, and two outputs (DC, AC). The battery, inverter, charger,
 and transfer switch all live inside one box. The natural model: four corners
 plus a central battery state.
 
@@ -124,7 +124,7 @@ options:
 | `title` | no | Header text. Omit to hide. |
 | `pv.entity` | no | Solar input watts. Import-only — clamped to ≥ 0. Corner shows "—" when omitted. |
 | `pv.name` / `pv.icon` | no | Display name / MDI icon. Defaults: `PV` / `mdi:solar-panel`. |
-| `grid.entity` | no | Grid input watts. Import-only — clamped to ≥ 0. Omit to hide the Grid corner and its flow line. |
+| `grid.entity` | no | Grid power in watts. Positive = input to the unit; negative = output from the unit. Omit to hide the Grid corner and its flow line. |
 | `grid.name` / `grid.icon` | no | Defaults: `Grid` / `mdi:transmission-tower`. |
 | `dc.entity` | no | DC output watts. Corner shows "—" when omitted. |
 | `dc.name` / `dc.icon` | no | Defaults: `DC` / `mdi:current-dc`. |
@@ -154,7 +154,7 @@ real WebSocket `render_template` API — full Jinja, all standard HA helpers
 (`states`, `state_attr`, `is_state`, `expand`, `|abs`, `|round`, `|float`,
 `{% if %}`, etc.).
 
-Example — clamp a noisy sensor:
+Example — clamp a noisy import-only sensor:
 
 ```yaml
 grid:
@@ -217,21 +217,22 @@ Once values are resolved:
 
 ```
 pv_power      = max(0, pv.entity)            (or 0 if pv not set)
-grid_power    = max(0, grid.entity)
+grid_power    = grid.entity                  (signed: +input, -output)
 dc_power      = max(0, dc.entity)            (or 0 if dc not set)
 ac_power      = max(0, ac.entity)
 battery_power = unit.power_entity (if set, optionally inverted)
                 else (grid_power + pv_power) − (ac_power + dc_power)
 ```
 
-Each flow is **active** when its corner's wattage exceeds `idle_threshold`.
+Each flow is **active** when its corner's wattage exceeds `idle_threshold` in magnitude. Grid is bidirectional; its sign determines the flow direction.
 
-- Active inflows (PV → battery, Grid → battery) animate from the corner toward
+- Active inflows (PV → battery, positive Grid → battery) animate from the corner toward
   the center.
+- Negative Grid (battery → Grid) animates from the center toward the Grid corner.
 - Active outflows (battery → AC, battery → DC) animate from the center toward
   the corner.
 - Inactive flows are grayed out, not hidden.
-- Animation speed scales with `power / max_power`.
+- Animation speed scales with `|power| / max_power`.
 
 Battery state inside the unit:
 

@@ -73,6 +73,10 @@
         <div id="card-charge"></div>
       </div>
       <div class="scenario">
+        <h2>Grid export (grid -500, soc 79)</h2>
+        <div id="card-grid-export"></div>
+      </div>
+      <div class="scenario">
         <h2>Discharging to AC (ac 347, soc 79, runtime 5h)</h2>
         <div id="card-discharge"></div>
       </div>
@@ -191,6 +195,8 @@
       const scenarios = [
         // Grid + AC active. Battery: 1407-312 = +1095 W -> charging.
         { id: 'card-charge',    state: { pv: 0,    grid: 1407, dc: 0,  ac: 312, soc: 80,  runtime: 60 } },
+        // Negative grid. Battery: -500 W -> discharging to Grid.
+        { id: 'card-grid-export', state: { pv: 0,    grid: -500, dc: 0,  ac: 0,   soc: 79,  runtime: 300 } },
         // No grid; AC only. Battery: -347 W -> discharging.
         { id: 'card-discharge', state: { pv: 0,    grid: 0,    dc: 0,  ac: 347, soc: 79,  runtime: 300 } },
         // Solar carrying load + filling battery.

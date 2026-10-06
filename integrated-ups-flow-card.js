@@ -672,9 +672,9 @@ class IntegratedUpsFlowCard extends HTMLElement {
       this._header.style.display = 'none';
     }
 
-    // Read raw values, clamping where the spec is "import only".
+    // Read raw values. Grid is bidirectional: positive = input, negative = output.
     const pvP = c.pv.entity ? Math.max(0, toNum(this._getRaw(c.pv.entity))) : 0;
-    const gridP = Math.max(0, toNum(this._getRaw(c.grid.entity)));
+    const gridP = toNum(this._getRaw(c.grid.entity));
     const dcP = c.dc.entity ? Math.max(0, toNum(this._getRaw(c.dc.entity))) : 0;
     const acP = Math.max(0, toNum(this._getRaw(c.ac.entity)));
 
@@ -778,7 +778,7 @@ class IntegratedUpsFlowCard extends HTMLElement {
 
     // ---- Flow paths active state & speed ----
     this._setFlowState('pv', pvP > opt.idle_threshold, pvP, opt.max_power);
-    this._setFlowState('grid', gridP > opt.idle_threshold, gridP, opt.max_power);
+    this._setFlowState('grid', Math.abs(gridP) > opt.idle_threshold, gridP, opt.max_power, gridP < 0);
     this._setFlowState('dc', dcP > opt.idle_threshold, dcP, opt.max_power);
     this._setFlowState('ac', acP > opt.idle_threshold, acP, opt.max_power);
 
@@ -812,7 +812,8 @@ class IntegratedUpsFlowCard extends HTMLElement {
     node.icon.setAttribute('icon', cfg.icon);
     node.name.textContent = cfg.name;
     node.power.textContent = fmtPower(power);
-    const active = power > idle;
+    // Grid is bidirectional; all other corners are input/output only.
+    const active = key === 'grid' ? Math.abs(power) > idle : power > idle;
     node.root.classList.toggle('is-active', active);
     // Clickable only when the entity is a plain entity_id (templates have no
     // single entity to open a more-info dialog for).
@@ -820,11 +821,12 @@ class IntegratedUpsFlowCard extends HTMLElement {
     node.root.classList.toggle('is-clickable', clickable);
   }
 
-  _setFlowState(key, active, power, maxPower) {
+  _setFlowState(key, active, power, maxPower, reverse = false) {
     const p = this._flowPaths[key];
     if (!p) return;
     p.base.classList.toggle('is-active', active);
     p.overlay.classList.toggle('is-active', active);
+    p.overlay.classList.toggle('is-reverse', active && reverse);
     const dur = this._durFromPower(power, maxPower);
     p.overlay.style.setProperty('--flow-dur', `${dur.toFixed(2)}s`);
   }
@@ -1088,6 +1090,7 @@ const STYLES = `
 
 .flow-overlay--pv.is-active   { stroke: var(--success-color, #4caf50); animation: flow-in  var(--flow-dur, 2s) linear infinite; }
 .flow-overlay--grid.is-active { stroke: var(--info-color, var(--primary-color, #03a9f4)); animation: flow-in  var(--flow-dur, 2s) linear infinite; }
+.flow-overlay--grid.is-active.is-reverse { animation-name: flow-out; }
 .flow-overlay--ac.is-active   { stroke: var(--warning-color, #ff9800); animation: flow-out var(--flow-dur, 2s) linear infinite; }
 .flow-overlay--dc.is-active   { stroke: var(--state-binary-sensor-power-on-color, #64b5f6); animation: flow-out var(--flow-dur, 2s) linear infinite; }
 
@@ -1360,7 +1363,7 @@ const TEMPLATE_SELECTOR = { template: {} };
 const EDITOR_LABELS = {
   title: 'Card title',
   pv: 'PV input (top-left)',
-  grid: 'Grid input (top-right)',
+  grid: 'Grid power (top-right)',
   dc: 'DC output (bottom-left)',
   ac: 'AC output (bottom-right)',
   unit: 'Battery (center)',
@@ -1479,7 +1482,7 @@ function buildEditorSchema(config) {
     {
       name: 'grid',
       type: 'expandable',
-      title: 'Grid input (top-right)',
+      title: 'Grid power (top-right)',
       schema: [
         { name: 'entity', selector: ENTITY_SELECTOR },
         { name: 'name', selector: { text: {} } },
