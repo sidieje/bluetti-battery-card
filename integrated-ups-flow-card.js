@@ -37,9 +37,15 @@
  * actions (toggle / more-info / call-service / navigate / url), and each
  * corner takes a `readings:` list — PV voltage and current being the common
  * ask — whose units default to the sensor's own.
+ *
+ * v0.7.0 keeps text readable at every size: the size/scale knobs shrink the
+ * layout, but text never shrinks below its normal size (it still grows when
+ * you scale up). Adds `header:` and `footer:` rows for sensors that don't
+ * belong to the power flow — each takes a `sensors:` list in the same shape
+ * as a corner's readings, and each can be hidden with `show: false`.
  */
 
-const CARD_VERSION = '0.6.1';
+const CARD_VERSION = '0.7.0';
 const CARD_TAG = 'integrated-ups-flow-card';
 const EDITOR_TAG = `${CARD_TAG}-editor`;
 
@@ -106,6 +112,16 @@ const BUTTON_STRIP_PX = 72;
 const BUTTON_MAX_SPLIT_ROWS = 2;
 
 const BUTTON_ACTIONS = ['more-info', 'toggle', 'call-service', 'navigate', 'url', 'none'];
+
+// Wording for the "ask for confirmation first" prompt, keyed by action, so a
+// toggle asks "Toggle DC?" instead of the generic "Run DC?".
+const ACTION_VERBS = {
+  'more-info': 'Open',
+  'toggle': 'Toggle',
+  'call-service': 'Run',
+  'navigate': 'Navigate to',
+  'url': 'Open',
+};
 
 // How often (ms) the relative-age line is refreshed so "Xs ago" keeps ticking
 // even when no new state arrives (a dropped integration stops pushing hass).
@@ -184,6 +200,20 @@ function normalizeReadings(list) {
     }));
 }
 
+// Config -> one header or footer row: an optional title plus a list of
+// sensors in the same shape as a corner's readings. `show: false` hides the
+// row without throwing its configuration away.
+function normalizeRow(row) {
+  if (row === undefined || row === null) return null;
+  if (typeof row === 'string') return { title: row, sensors: [], show: true };
+  if (typeof row !== 'object' || Array.isArray(row)) return null;
+  return {
+    title: row.title !== undefined && row.title !== null ? String(row.title) : null,
+    sensors: normalizeReadings(row.sensors ?? row.entities),
+    show: row.show === undefined ? true : !!row.show,
+  };
+}
+
 // Config -> normalized button list. `action` is inferred when omitted so the
 // common cases stay short: a service means call-service, an entity alone
 // means more-info.
@@ -213,6 +243,10 @@ function normalizeButtons(list) {
         url: b.url ? String(b.url) : null,
         color: b.color ? String(b.color) : null,
         confirmation: !!b.confirmation,
+        confirmation_text:
+          b.confirmation_text !== undefined && b.confirmation_text !== null
+            ? String(b.confirmation_text)
+            : null,
       };
     });
 }
@@ -352,6 +386,11 @@ class IntegratedUpsFlowCard extends HTMLElement {
 
     this._config = {
       title: config.title ?? null,
+      // Optional rows above/below the diagram for sensors that don't belong to
+      // the power flow. A header, when present, takes over drawing the title
+      // (it falls back to the top-level `title:`), so the two never duplicate.
+      header: normalizeRow(config.header),
+      footer: normalizeRow(config.footer),
       pv: corner(pv, 'PV', 'mdi:solar-panel'),
       grid: corner(grid, 'Grid', 'mdi:transmission-tower'),
       dc: corner(dc, 'DC', 'mdi:current-dc'),
@@ -464,7 +503,9 @@ class IntegratedUpsFlowCard extends HTMLElement {
     if (measured > 0) return Math.max(2, Math.ceil(measured / LOVELACE_ROW_PX));
     const s = this._effectiveScale();
     let h = (320 + 32) * s;
-    if (this._config.title) h += 34 * s + 12;
+    // The header replaces the plain title row when configured.
+    h += this._rowHeight(s, this._config.header) || (this._config.title ? 34 * s + 12 : 0);
+    h += this._rowHeight(s, this._config.footer);
     h += this._buttonStripHeight(s);
     return Math.max(2, Math.round(h / LOVELACE_ROW_PX));
   }
@@ -501,6 +542,28 @@ class IntegratedUpsFlowCard extends HTMLElement {
     return this._buttonRowHeight(scale) * rows + gap * rows;
   }
 
+  // A header/footer row is one line of text (title and sensors share it) plus
+  // its margin. Only used for the pre-layout getCardSize() estimate.
+  _rowHeight(scale, row) {
+    if (!row || !row.show) return 0;
+    return 28 * scale + 10;
+  }
+
+  // Entities shown by the visible header/footer rows. Unlike the corner
+  // readings these are unrelated sensors, so they take part in template
+  // subscriptions but deliberately stay out of the staleness calculation — a
+  // slow room temperature sensor shouldn't make the UPS look stale.
+  _rowEntities() {
+    if (!this._config) return [];
+    const out = [];
+    for (const key of ['header', 'footer']) {
+      const row = this._config[key];
+      if (!row || !row.show || !Array.isArray(row.sensors)) continue;
+      for (const r of row.sensors) if (r.entity) out.push(r.entity);
+    }
+    return out;
+  }
+
   // ----- Template subscriptions (real HA WS API) -----
 
   // Entity IDs behind every configured corner reading. They participate in
@@ -521,11 +584,15 @@ class IntegratedUpsFlowCard extends HTMLElement {
     if (!this._config) return [];
     const c = this._config;
     return [
+      c.title,
+      c.header && c.header.show ? c.header.title : null,
+      c.footer && c.footer.show ? c.footer.title : null,
       c.pv.entity,
       c.grid.entity,
       c.dc.entity,
       c.ac.entity,
       ...this._readingEntities(),
+      ...this._rowEntities(),
       c.unit.soc_entity,
       c.unit.power_entity,
       c.display.runtime_entity,
@@ -608,10 +675,10 @@ class IntegratedUpsFlowCard extends HTMLElement {
     root.appendChild(card);
     this._card = card;
 
-    const header = document.createElement('div');
-    header.className = 'ups-header';
-    card.appendChild(header);
-    this._header = header;
+    // Header row: the card title plus optional sensors. Filled in by
+    // _updateRow(); hidden entirely when there's nothing to show.
+    this._header = this._createRow('header');
+    card.appendChild(this._header.root);
 
     const wrap = document.createElement('div');
     wrap.className = 'ups-wrap';
@@ -670,6 +737,30 @@ class IntegratedUpsFlowCard extends HTMLElement {
     buttons.style.display = 'none';
     card.appendChild(buttons);
     this._buttons = buttons;
+
+    // Footer row: the last thing in the card, for readings that don't belong
+    // to the power flow (and don't fit in a corner).
+    this._footer = this._createRow('footer');
+    card.appendChild(this._footer.root);
+  }
+
+  // One header/footer row: title element on the left, sensor items on the
+  // right. The items themselves are created on demand by _syncReadingEls().
+  _createRow(kind) {
+    const root = document.createElement('div');
+    root.className = `ups-row ups-row--${kind}`;
+    root.style.display = 'none';
+
+    const title = document.createElement('div');
+    title.className = 'ups-row__title';
+    root.appendChild(title);
+
+    const sensors = document.createElement('div');
+    sensors.className = 'ups-row__sensors';
+    sensors.style.display = 'none';
+    root.appendChild(sensors);
+
+    return { root, title, sensors };
   }
 
   _createCornerNode(key, position) {
@@ -705,7 +796,7 @@ class IntegratedUpsFlowCard extends HTMLElement {
 
     root.addEventListener('click', (e) => this._handleCornerClick(key, e));
 
-    return { root, icon, name, power, iconWrap, readings, readingEls: [] };
+    return { root, icon, name, power, iconWrap, readings };
   }
 
   // Fire `hass-more-info` so the lovelace shell opens its standard dialog.
@@ -845,12 +936,8 @@ class IntegratedUpsFlowCard extends HTMLElement {
     // Single knob the stylesheet multiplies every base dimension by.
     this.style.setProperty('--ups-scale', String(this._effectiveScale()));
 
-    if (c.title) {
-      this._header.textContent = c.title;
-      this._header.style.display = '';
-    } else {
-      this._header.style.display = 'none';
-    }
+    this._updateRow(this._header, c.header, c.title);
+    this._updateRow(this._footer, c.footer, null);
 
     // Read raw values, clamping where the spec is "import only".
     const pvP = c.pv.entity ? Math.max(0, toNum(this._getRaw(c.pv.entity))) : 0;
@@ -1005,21 +1092,42 @@ class IntegratedUpsFlowCard extends HTMLElement {
     node.root.classList.toggle('is-clickable', clickable);
   }
 
-  // Extra sub-readings under a corner. The row is rebuilt only when the
-  // configured count changes; the values themselves refresh every render.
+  // Extra sub-readings under a corner.
   _updateReadings(node, cfg) {
-    const readings = (cfg && cfg.readings) || [];
-    if (readings.length === 0) {
-      node.readings.style.display = 'none';
+    this._syncReadingEls(node.readings, (cfg && cfg.readings) || [], 'corner__reading');
+  }
+
+  // One reading's display text: optional label plus value, with an omitted
+  // `unit:` falling back to whatever the sensor reports.
+  _readingText(r) {
+    let unit = r.unit;
+    if (unit === null && !isTemplate(r.entity) && this._hass && this._hass.states) {
+      const s = this._hass.states[r.entity];
+      const uom = s && s.attributes && s.attributes.unit_of_measurement;
+      if (uom) unit = String(uom);
+    }
+    const value = fmtReading(this._getRaw(r.entity), r.decimals, unit) || '—';
+    return r.label ? `${r.label} ${value}` : value;
+  }
+
+  // Shared by the corner readings and the header/footer rows: rebuilds the
+  // items only when the entities behind them change (so their click handlers
+  // stay current), then refreshes every value. Each item opens the sensor's
+  // more-info dialog, unless its entity is a template.
+  _syncReadingEls(container, list, className) {
+    if (list.length === 0) {
+      container.style.display = 'none';
       return;
     }
-    node.readings.style.display = '';
+    container.style.display = '';
 
-    if (node.readingEls.length !== readings.length) {
-      node.readings.innerHTML = '';
-      node.readingEls = readings.map((r) => {
+    const key = list.map((r) => r.entity).join('\u0000');
+    if (container._readingKey !== key) {
+      container._readingKey = key;
+      container.innerHTML = '';
+      for (const r of list) {
         const el = document.createElement('div');
-        el.className = 'corner__reading';
+        el.className = className;
         if (r.entity && !isTemplate(r.entity)) {
           el.classList.add('is-clickable');
           el.addEventListener('click', (e) => {
@@ -1027,23 +1135,32 @@ class IntegratedUpsFlowCard extends HTMLElement {
             this._fireMoreInfo(r.entity);
           });
         }
-        node.readings.appendChild(el);
-        return el;
-      });
+        container.appendChild(el);
+      }
     }
 
-    readings.forEach((r, i) => {
-      const el = node.readingEls[i];
-      // An omitted `unit:` falls back to whatever the sensor reports.
-      let unit = r.unit;
-      if (unit === null && !isTemplate(r.entity) && this._hass && this._hass.states) {
-        const s = this._hass.states[r.entity];
-        const uom = s && s.attributes && s.attributes.unit_of_measurement;
-        if (uom) unit = String(uom);
-      }
-      const value = fmtReading(this._getRaw(r.entity), r.decimals, unit) || '—';
-      el.textContent = r.label ? `${r.label} ${value}` : value;
+    Array.from(container.children).forEach((el, i) => {
+      el.textContent = this._readingText(list[i]);
     });
+  }
+
+  // Header / footer row: optional title on the left, sensors on the right.
+  // `fallbackTitle` is the top-level `title:`, which a header row inherits
+  // when it doesn't set its own — that way the two never render twice.
+  _updateRow(row, cfg, fallbackTitle) {
+    const title = cfg ? (cfg.title !== null ? cfg.title : fallbackTitle) : fallbackTitle;
+    const visible = cfg ? cfg.show : !!fallbackTitle;
+    if (!visible) {
+      row.root.style.display = 'none';
+      return;
+    }
+    row.root.style.display = '';
+
+    const text = title ? this._resolveOverride(title) : '';
+    row.title.textContent = text || '';
+    row.title.style.display = text ? '' : 'none';
+
+    this._syncReadingEls(row.sensors, (cfg && cfg.sensors) || [], 'ups-row__sensor');
   }
 
   _setFlowState(key, active, power, maxPower) {
@@ -1283,7 +1400,17 @@ class IntegratedUpsFlowCard extends HTMLElement {
     if (event) event.stopPropagation();
     if (button.action === 'none') return;
     if (button.confirmation) {
-      const text = button.confirmation_text || `Run ${button.name || button.service || button.action}?`;
+      // Word the prompt after what the button actually does, so a toggle asks
+      // "Toggle DC?" instead of the generic "Run DC?".
+      const label =
+        button.name ||
+        button.service ||
+        button.entity ||
+        button.navigation_path ||
+        button.url ||
+        button.action;
+      const verb = ACTION_VERBS[button.action] || 'Run';
+      const text = button.confirmation_text || `${verb} ${label}?`;
       if (!window.confirm(text)) return;
     }
 
@@ -1450,9 +1577,17 @@ const STYLES = `
   /* --ups-scale is set inline from options.size × options.scale. Every
      dimension below is calc(<base> * var(--ups-s)), so one number resizes
      the whole card. The narrow-column rules at the bottom of the sheet
-     re-derive --ups-s with an extra factor. */
+     re-derive --ups-s with an extra factor.
+     --ups-t is the *text* knob: it never goes below 1, so shrinking the card
+     (compact, or a small scale:) tightens the layout without making the
+     numbers hard to read. It only follows the narrow-column factor, where a
+     thin column genuinely has no room for full-size text.
+     --ups-b sizes the big SoC readout, which lives inside the battery circle
+     and so has to stay roughly proportional to it — it floors at 0.85. */
   --ups-scale: 1;
   --ups-s: calc(var(--ups-scale) * 1);
+  --ups-t: max(1, var(--ups-scale));
+  --ups-b: max(0.85, var(--ups-scale));
   /* Makes the card its own query container so the narrow shrink follows the
      column the card sits in, not the browser window. */
   container-type: inline-size;
@@ -1461,12 +1596,48 @@ const STYLES = `
   padding: calc(16px * var(--ups-s));
   box-sizing: border-box;
 }
-.ups-header {
-  font-size: calc(1.1rem * var(--ups-s));
+/* Header / footer rows. The header carries the card title (and, when a
+   "header:" block is configured, a row of extra sensors); the footer is the
+   same row pinned to the bottom of the card. Both use --ups-t so their text
+   stays readable at compact size. */
+.ups-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: calc(2px * var(--ups-s)) calc(12px * var(--ups-s));
+  padding: 0 4px;
+}
+.ups-row__title {
+  font-size: calc(1.1rem * var(--ups-t));
   font-weight: 500;
   color: var(--primary-text-color, #212121);
+}
+.ups-row__sensors {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: calc(2px * var(--ups-s)) calc(12px * var(--ups-s));
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.ups-row__sensor {
+  font-size: calc(0.8rem * var(--ups-t));
+  color: var(--secondary-text-color, #727272);
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.ups-row__sensor.is-clickable { cursor: pointer; }
+.ups-row__sensor.is-clickable:hover { color: var(--primary-text-color, #212121); }
+.ups-row--header {
   margin-bottom: calc(12px * var(--ups-s));
-  padding: 0 4px;
+}
+.ups-row--footer {
+  margin-top: calc(10px * var(--ups-s));
+  padding-top: calc(8px * var(--ups-s));
+  border-top: 1px solid var(--divider-color, rgba(127, 127, 127, 0.32));
+}
+.ups-row--footer .ups-row__title {
+  font-size: calc(0.9rem * var(--ups-t));
 }
 .ups-wrap {
   position: relative;
@@ -1592,14 +1763,14 @@ const STYLES = `
 .corner--tl .corner__meta,
 .corner--bl .corner__meta { align-items: flex-start; text-align: left; }
 .corner__power {
-  font-size: calc(1.15rem * var(--ups-s));
+  font-size: calc(1.15rem * var(--ups-t));
   font-weight: 700;
   color: var(--primary-text-color, #fff);
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 .corner__name {
-  font-size: calc(0.78rem * var(--ups-s));
+  font-size: calc(0.78rem * var(--ups-t));
   color: var(--secondary-text-color, #999);
   letter-spacing: 0.02em;
   margin-top: 1px;
@@ -1616,7 +1787,7 @@ const STYLES = `
   font-variant-numeric: tabular-nums;
 }
 .corner__reading {
-  font-size: calc(0.72rem * var(--ups-s));
+  font-size: calc(0.72rem * var(--ups-t));
   color: var(--secondary-text-color, #999);
   line-height: 1.2;
   white-space: nowrap;
@@ -1688,20 +1859,20 @@ const STYLES = `
 .battery-center.soc-unknown .battery-icon { color: var(--secondary-text-color, #999); }
 
 .battery-soc {
-  font-size: calc(2.6rem * var(--ups-s));
+  font-size: calc(2.6rem * var(--ups-b));
   font-weight: 700;
   color: var(--primary-text-color, #fff);
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
 .battery-soc-unit {
-  font-size: calc(1rem * var(--ups-s));
+  font-size: calc(1rem * var(--ups-t));
   margin-left: 2px;
   color: var(--secondary-text-color, #999);
   font-weight: 500;
 }
 .battery-state {
-  font-size: calc(0.8rem * var(--ups-s));
+  font-size: calc(0.8rem * var(--ups-t));
   color: var(--secondary-text-color, #999);
   text-transform: capitalize;
   margin-top: calc(4px * var(--ups-s));
@@ -1710,7 +1881,7 @@ const STYLES = `
 .battery-center.state-charge .battery-state    { color: var(--success-color, #4caf50); }
 .battery-center.state-discharge .battery-state { color: var(--warning-color, #ff9800); }
 .battery-throughput {
-  font-size: calc(0.85rem * var(--ups-s));
+  font-size: calc(0.85rem * var(--ups-t));
   font-weight: 600;
   color: var(--secondary-text-color, #999);
   margin-top: calc(2px * var(--ups-s));
@@ -1720,7 +1891,7 @@ const STYLES = `
 .battery-center.state-charge .battery-throughput    { color: var(--success-color, #4caf50); }
 .battery-center.state-discharge .battery-throughput { color: var(--warning-color, #ff9800); }
 .battery-runtime {
-  font-size: calc(0.78rem * var(--ups-s));
+  font-size: calc(0.78rem * var(--ups-t));
   color: var(--secondary-text-color, #999);
   margin-top: calc(2px * var(--ups-s));
   font-variant-numeric: tabular-nums;
@@ -1730,7 +1901,7 @@ const STYLES = `
   display: inline-flex;
   align-items: center;
   gap: calc(3px * var(--ups-s));
-  font-size: calc(0.72rem * var(--ups-s));
+  font-size: calc(0.72rem * var(--ups-t));
   color: var(--secondary-text-color, #999);
   margin-top: calc(4px * var(--ups-s));
   font-variant-numeric: tabular-nums;
@@ -1787,7 +1958,7 @@ const STYLES = `
   background: var(--secondary-background-color, rgba(127, 127, 127, 0.14));
   color: var(--primary-text-color, #fff);
   font-family: inherit;
-  font-size: calc(0.82rem * var(--ups-s));
+  font-size: calc(0.82rem * var(--ups-t));
   font-weight: 600;
   cursor: pointer;
   overflow: hidden;
@@ -1815,7 +1986,7 @@ const STYLES = `
   color: var(--ups-btn-accent, var(--primary-color, #03a9f4));
 }
 /* Half-height buttons (two rows of three) get tighter type. */
-.ups-buttons.is-compact .ups-btn { font-size: calc(0.72rem * var(--ups-s)); }
+.ups-buttons.is-compact .ups-btn { font-size: calc(0.72rem * var(--ups-t)); }
 .ups-buttons.is-compact .ups-btn__icon { --mdc-icon-size: calc(16px * var(--ups-s)); }
 
 /* Responsive ---------------------------------------------------------
@@ -1829,6 +2000,8 @@ const STYLES = `
   @media (max-width: ${NARROW_BREAKPOINT}px) {
     :host {
       --ups-s: calc(var(--ups-scale) * ${NARROW_FACTOR});
+      --ups-t: calc(max(1, var(--ups-scale)) * ${NARROW_FACTOR});
+      --ups-b: calc(max(0.85, var(--ups-scale)) * ${NARROW_FACTOR});
     }
     .ups-grid { grid-template-columns: 1fr 1.4fr 1fr; }
   }
@@ -1836,6 +2009,8 @@ const STYLES = `
 @container (max-width: ${NARROW_BREAKPOINT}px) {
   .ups-card {
     --ups-s: calc(var(--ups-scale) * ${NARROW_FACTOR});
+    --ups-t: calc(max(1, var(--ups-scale)) * ${NARROW_FACTOR});
+    --ups-b: calc(max(0.85, var(--ups-scale)) * ${NARROW_FACTOR});
   }
   .ups-grid { grid-template-columns: 1fr 1.4fr 1fr; }
 }
@@ -1858,11 +2033,14 @@ const CONTROL_ENTITY_SELECTOR = { entity: {} };
 const TEMPLATE_SELECTOR = { template: {} };
 
 // ha-form has no repeatable list, so the editor exposes fixed slots instead:
-// `<corner>.reading1_*` / `.reading2_*` for extra readings and top-level
-// `button1`..`button6` for the button strip. configToFormSlots /
-// formSlotsToConfig translate between those slots and the YAML arrays.
+// `<corner>.reading1_*` / `.reading2_*` for extra readings, `header.sensor1_*`
+// / `footer.sensor1_*` for the row sensors, and top-level `button1`..`button6`
+// for the button strip. configToFormSlots / formSlotsToConfig translate between
+// those slots and the YAML arrays.
 const CORNER_KEYS = ['pv', 'grid', 'dc', 'ac'];
+const ROW_KEYS = ['header', 'footer'];
 const MAX_EDITOR_READINGS = 2;
+const MAX_EDITOR_SENSORS = 4;
 const MAX_EDITOR_BUTTONS = 6;
 
 // Top-level field labels (shown on the form input)
@@ -1902,6 +2080,10 @@ const EDITOR_LABELS = {
   url: 'URL to open',
   color: 'Accent color',
   confirmation: 'Ask for confirmation first',
+  confirmation_text: 'Confirmation text',
+  header: 'Header row',
+  footer: 'Footer row',
+  show: 'Show this row',
 };
 
 // Per-field helper text rendered under the input.
@@ -1948,6 +2130,13 @@ const EDITOR_HELPERS = {
     'Accent color for this button (hex or CSS color). Used for the icon and the "on" outline.',
   confirmation:
     'Shows a confirm prompt before running the action. Worth enabling for anything that turns the unit off.',
+  confirmation_text:
+    'Custom prompt text. Leave empty and the card asks using the action, e.g. "Toggle DC?" or "Run switch.turn_on?".',
+  header:
+    'A line above the diagram: the card title on the left, extra sensors on the right. Hiding it also hides the card title.',
+  footer:
+    'A line at the bottom of the card for sensors that do not belong to the power flow (room temperature, firmware, ...).',
+  show: 'Turn this off to hide the row without deleting the sensors behind it.',
 };
 
 // Labels/helpers for the per-corner reading slots — generated because the same
@@ -1964,6 +2153,22 @@ for (let i = 1; i <= MAX_EDITOR_READINGS; i++) {
   EDITOR_HELPERS[`reading${i}_unit`] =
     'Leave empty to use whatever unit the sensor itself reports.';
   EDITOR_HELPERS[`reading${i}_decimals`] =
+    'Leave empty to default to 1 decimal place.';
+}
+
+// Same for the header/footer sensor slots (shared by both rows).
+for (let i = 1; i <= MAX_EDITOR_SENSORS; i++) {
+  EDITOR_LABELS[`sensor${i}_entity`] = `Sensor ${i} — entity`;
+  EDITOR_LABELS[`sensor${i}_label`] = `Sensor ${i} — prefix label`;
+  EDITOR_LABELS[`sensor${i}_unit`] = `Sensor ${i} — unit`;
+  EDITOR_LABELS[`sensor${i}_decimals`] = `Sensor ${i} — decimal places`;
+  EDITOR_HELPERS[`sensor${i}_entity`] =
+    "Shown in the row. Clicking it opens this sensor's more-info dialog.";
+  EDITOR_HELPERS[`sensor${i}_label`] =
+    'Optional text in front of the value, e.g. "Room" so it reads "Room 21.5 °C".';
+  EDITOR_HELPERS[`sensor${i}_unit`] =
+    'Leave empty to use whatever unit the sensor itself reports.';
+  EDITOR_HELPERS[`sensor${i}_decimals`] =
     'Leave empty to default to 1 decimal place.';
 }
 
@@ -1996,6 +2201,25 @@ function configToFormSlots(config) {
       if (corner[`reading${i}_entity`] === undefined) corner[`reading${i}_entity`] = '';
     }
     c[key] = corner;
+  }
+
+  // Header / footer rows get the same slot treatment. `show` is materialised
+  // as a real boolean so the checkbox reflects the default (shown) even when
+  // the block is absent from the YAML.
+  for (const key of ROW_KEYS) {
+    const row = c[key] && typeof c[key] === 'object' ? { ...c[key] } : {};
+    if (Array.isArray(row.sensors)) {
+      for (let i = 0; i < MAX_EDITOR_SENSORS; i++) {
+        const s = row.sensors[i] || {};
+        row[`sensor${i + 1}_entity`] = s.entity ?? '';
+        row[`sensor${i + 1}_label`] = s.label ?? '';
+        row[`sensor${i + 1}_unit`] = s.unit ?? '';
+        row[`sensor${i + 1}_decimals`] = Number.isFinite(s.decimals) ? s.decimals : undefined;
+      }
+      delete row.sensors;
+    }
+    if (row.show === undefined) row.show = true;
+    c[key] = row;
   }
 
   const buttons = Array.isArray(c.buttons) ? c.buttons : null;
@@ -2035,6 +2259,36 @@ function formSlotsToConfig(config) {
     if (readings.length) corner.readings = readings;
     else delete corner.readings;
     c[key] = corner;
+  }
+
+  for (const key of ROW_KEYS) {
+    if (!c[key] || typeof c[key] !== 'object') continue;
+    const row = { ...c[key] };
+    const sensors = [];
+    for (let i = 1; i <= MAX_EDITOR_SENSORS; i++) {
+      const entity = row[`sensor${i}_entity`];
+      const label = row[`sensor${i}_label`];
+      const unit = row[`sensor${i}_unit`];
+      const decimals = row[`sensor${i}_decimals`];
+      delete row[`sensor${i}_entity`];
+      delete row[`sensor${i}_label`];
+      delete row[`sensor${i}_unit`];
+      delete row[`sensor${i}_decimals`];
+      if (!entity) continue;
+      const s = { entity };
+      if (label) s.label = label;
+      if (unit) s.unit = unit;
+      if (Number.isFinite(decimals)) s.decimals = decimals;
+      sensors.push(s);
+    }
+    if (sensors.length) row.sensors = sensors;
+    else delete row.sensors;
+    if (!row.title) delete row.title;
+    // Shown is the default, so only an unchecked box is worth writing to YAML.
+    if (row.show !== false) delete row.show;
+    // Never leave an empty `header:` / `footer:` block behind.
+    if (Object.keys(row).length) c[key] = row;
+    else delete c[key];
   }
 
   const buttons = [];
@@ -2094,6 +2348,9 @@ function buttonSection(n, b) {
   }
   schema.push({ name: 'color', selector: { text: {} } });
   schema.push({ name: 'confirmation', selector: { boolean: {} } });
+  if (b.confirmation) {
+    schema.push({ name: 'confirmation_text', selector: { text: {} } });
+  }
 
   return { name: `button${n}`, type: 'expandable', title: `Button ${n}`, schema };
 }
@@ -2180,6 +2437,38 @@ function buildEditorSchema(config) {
     return { name: key, type: 'expandable', title, schema };
   });
 
+  // Header / footer rows: a hide toggle plus the shared sensor slots. As with
+  // the corners, a slot only appears once the previous one names a sensor.
+  const rowSections = [
+    ['header', 'Header row (title + sensors)'],
+    ['footer', 'Footer row (sensors)'],
+  ].map(([key, sectionTitle]) => {
+    const row = c[key] || {};
+    const schema = [];
+    if (key === 'header') {
+      schema.push({
+        name: 'title',
+        label: 'Header title',
+        helper:
+          'Leave empty to use the card title above. When a header row is configured it replaces that plain title line, so set it here or above, not both.',
+        selector: { text: {} },
+      });
+    }
+    schema.push({ name: 'show', selector: { boolean: {} } });
+    for (let i = 1; i <= MAX_EDITOR_SENSORS; i++) {
+      if (i > 1 && !row[`sensor${i - 1}_entity`]) break;
+      schema.push({ name: `sensor${i}_entity`, selector: ENTITY_SELECTOR });
+      if (!row[`sensor${i}_entity`]) continue;
+      schema.push({ name: `sensor${i}_label`, selector: { text: {} } });
+      schema.push({ name: `sensor${i}_unit`, selector: { text: {} } });
+      schema.push({
+        name: `sensor${i}_decimals`,
+        selector: { number: { min: 0, max: 4, step: 1, mode: 'box' } },
+      });
+    }
+    return { name: key, type: 'expandable', title: sectionTitle, schema };
+  });
+
   const buttonSections = [];
   for (let i = 1; i <= MAX_EDITOR_BUTTONS; i++) {
     if (i > 1) {
@@ -2193,6 +2482,7 @@ function buildEditorSchema(config) {
 
   return [
     { name: 'title', selector: { text: {} } },
+    rowSections[0],
     ...cornerSections,
     {
       name: 'unit',
@@ -2215,6 +2505,7 @@ function buildEditorSchema(config) {
       title: 'Options',
       schema: optionsSchema,
     },
+    rowSections[1],
     ...buttonSections,
   ];
 }
@@ -2255,7 +2546,7 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
       const hint = document.createElement('div');
       hint.className = 'hint';
       hint.textContent =
-        'Every field is optional. Configured corners are clickable (opens the entity more-info dialog); unconfigured corners are hidden along with their flow line. Extra sensors go in the reading slots of a corner, and buttons go in the Button sections (or a buttons: list in YAML).';
+        'Every field is optional. Configured corners are clickable (opens the entity more-info dialog); unconfigured corners are hidden along with their flow line. Extra sensors go in the reading slots of a corner, sensors outside the power flow go in the Header or Footer row, and buttons go in the Button sections (or a buttons: list in YAML).';
       this.shadowRoot.appendChild(hint);
 
       const form = document.createElement('ha-form');
@@ -2320,8 +2611,8 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
     this._form.hass = this._hass;
     this._form.schema = buildEditorSchema(data);
     this._form.data = data;
-    this._form.computeLabel = (schema) => EDITOR_LABELS[schema.name] || schema.name;
-    this._form.computeHelper = (schema) => EDITOR_HELPERS[schema.name] || undefined;
+    this._form.computeLabel = (schema) => schema.label || EDITOR_LABELS[schema.name] || schema.name;
+    this._form.computeHelper = (schema) => schema.helper || EDITOR_HELPERS[schema.name] || undefined;
   }
 }
 

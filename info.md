@@ -26,12 +26,16 @@ state-of-charge gauge. Flow lines animate when their input/output is active.
   unavailable
 - Optional DC and PV corners — show "—" when not configured
 - Configurable size — `compact` / `normal` / `large` presets plus a 0.4–2.2
-  scale slider, with everything (fonts, icons, gauge, flow lines) scaling
-  together
+  scale slider. The layout (icons, gauge, flow lines, spacing) scales together
+  while the text stays at its normal size, so a compact card is still readable
 - Action-button strip under the diagram — toggle, more-info, call-service,
-  navigate or URL actions, laid out three per row
+  navigate or URL actions, laid out three per row, each with an optional
+  action-aware confirmation prompt ("Toggle Solar bypass?")
 - Extra readings per corner (e.g. PV voltage and current), with units taken
   from the sensor and click-through to more-info
+- Header and footer sensor rows — the card title plus sensors that sit outside
+  the power flow (cabinet temperature, cycle count, firmware, room sensors),
+  each row hideable with `show: false`
 - Backward-compatible: v0.1 configs using `load:` are accepted and rendered as
   the AC corner
 

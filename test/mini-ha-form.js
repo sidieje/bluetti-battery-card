@@ -149,8 +149,13 @@ class MiniSelector extends HTMLElement {
   get schema() { return this._schema; }
   set value(v) {
     this._value = v;
+    if (!this._input) return;
+    if (this._input.dataset.kind === 'boolean') {
+      this._input.checked = Boolean(v);
+      return;
+    }
     const text = v === undefined || v === null ? '' : String(v);
-    if (this._input && this._input.value !== text) this._input.value = text;
+    if (this._input.value !== text) this._input.value = text;
   }
   get value() { return this._value; }
   set label(v) { if (this._lbl) this._lbl.textContent = v; }
@@ -195,6 +200,7 @@ class MiniSelector extends HTMLElement {
       });
     }
     this._lbl.textContent = this._schema.name;
+    if (this._value !== undefined) this.value = this._value;
   }
 }
 customElements.define('mini-selector', MiniSelector);

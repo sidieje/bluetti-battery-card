@@ -65,15 +65,25 @@ add the card via the dashboard's "Add card" picker, or edit an existing card
 and choose **Show visual editor**, you'll get an entity-picker form with
 collapsible sections for each corner, the unit, the center display, and the
 options. Since v0.6 each corner section also holds two extra-reading slots, and
-the form grows up to six button sections as you fill them in. YAML mode still
-works for everything the editor exposes, plus anything Jinja that the editor's
-selectors don't render.
+the form grows up to six button sections as you fill them in. Since v0.7 there
+are **Header row** and **Footer row** sections for sensors that sit outside the
+power flow. YAML mode still works for everything the editor exposes, plus
+anything Jinja that the editor's selectors don't render.
 
-### Schema (v0.6)
+### Schema (v0.7)
 
 ```yaml
 type: custom:integrated-ups-flow-card
 title: Elite 200 V2          # optional header
+
+header:                      # optional — title row + extra sensors (v0.7)
+  title: Elite 200 V2        # defaults to the card title above
+  show: true                 # false hides the row, title included
+  sensors:
+    - entity: sensor.elite_200_v2_01_cabinet_temperature
+      label: Cabinet
+    - entity: sensor.elite_200_v2_01_cycle_count
+      decimals: 0
 
 # Inputs (top corners)
 pv:                          # optional — top-left corner
@@ -131,17 +141,35 @@ buttons:
     icon: mdi:power-plug
     entity: switch.elite_200_v2_01_ac_outlet
     action: toggle
+  - name: Solar bypass
+    entity: switch.elite_200_v2_01_solar_pass
+    action: toggle
+    confirmation: true          # asks "Toggle Solar bypass?" first
   - name: Energy
     icon: mdi:transmission-tower
     action: navigate
     navigation_path: /lovelace/energy
+
+footer:                        # optional — sensor row under the buttons (v0.7)
+  show: true
+  sensors:
+    - entity: sensor.house_living_room_temperature
+      label: Living room
+    - entity: sensor.house_co2
+      label: CO2
+      decimals: 0
 ```
 
 ### Field reference
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `title` | no | Header text. Omit to hide. |
+| `title` | no | Header text. Omit to hide. A `header:` block can replace it (see [Header & footer sensor rows](#header--footer-sensor-rows)). |
+| `header` | no | Title row above the diagram, with optional sensors beside the title (see [Header & footer sensor rows](#header--footer-sensor-rows)). Added in v0.7. |
+| `header.title` | no | Row title. Defaults to the top-level `title`. Accepts a Jinja template. |
+| `header.show` | no | `false` hides the whole row — the card title goes with it. Default `true`. |
+| `header.sensors` | no | Sensor entries on the right of the row. Same fields as [reading entries](#reading-entries). |
+| `footer` | no | Sensor row under the button strip. Same `show` / `sensors` fields; `footer.title` is YAML-only. Added in v0.7. |
 | `pv.entity` | no | Solar input watts. Import-only — clamped to ≥ 0. Corner shows "—" when omitted. |
 | `pv.name` / `pv.icon` | no | Display name / MDI icon. Defaults: `PV` / `mdi:solar-panel`. |
 | `grid.entity` | no | Grid input watts. Import-only — clamped to ≥ 0. Omit to hide the Grid corner and its flow line. |
@@ -211,13 +239,22 @@ Each of the four corners (PV, Grid, DC, AC) and the central battery is
 clickable and opens Home Assistant's standard more-info dialog for the
 configured entity — `pv.entity`, `grid.entity`, `dc.entity`, `ac.entity`, and
 `unit.soc_entity` respectively. Corners whose entity is configured as a Jinja
-template are non-clickable (a template doesn't map to a single entity).
+template are non-clickable (a template doesn't map to a single entity). The
+extra readings under a corner and the sensors in the [header and footer
+rows](#header--footer-sensor-rows) are clickable in the same way, each opening
+its own entity.
 
 ## Sizing
 
-Added in **v0.6.0**. The whole card — corners, battery circle, fonts, icons,
-flow lines and the center stack — scales from one knob, so shrinking it never
-breaks the layout.
+Added in **v0.6.0**; text behaviour changed in **v0.7.0**. The size preset
+scales the layout — corners, battery circle, icons, flow lines, spacing and the
+center stack — from one knob, so shrinking it never breaks the layout. **Text
+does not shrink with the preset**: labels, watts and row sensors stay at their
+normal size, because the card's width comes from the dashboard column and a
+compact card has just as much horizontal room for words. Only the SoC number
+inside the battery circle scales down with the circle (never below 0.85×), and
+in a genuinely narrow column (below 560 px) the text shrinks too, so it keeps
+fitting.
 
 ```yaml
 options:
@@ -268,6 +305,56 @@ sensor goes `unavailable` shows `—`.
 The visual editor exposes two reading slots per corner; a second slot appears
 once the first names a sensor. YAML takes as many as you want.
 
+## Header & footer sensor rows
+
+Added in **v0.7.0**. Some sensors don't belong to the power flow — cabinet
+temperature, cycle count, firmware, a room sensor next to the unit. They go in
+one of two rows: a **header** row above the diagram (which also carries the
+card title) and a **footer** row under the button strip.
+
+```yaml
+title: Elite 200 V2
+
+header:
+  title: Elite 200 V2 — home UPS   # defaults to the title above
+  show: true
+  sensors:
+    - entity: sensor.elite_200_v2_01_cabinet_temperature
+      label: Cabinet
+    - entity: sensor.elite_200_v2_01_cycle_count
+      decimals: 0
+    - entity: sensor.elite_200_v2_01_firmware
+
+footer:
+  sensors:
+    - entity: sensor.house_living_room_temperature
+      label: Living room
+    - entity: sensor.house_co2
+      label: CO2
+      decimals: 0
+```
+
+The title sits on the left, the sensors on the right, wrapping onto extra lines
+when the column is tight. Each entry uses the same fields as a corner
+[reading](#reading-entries) (`entity`, `label`, `unit`, `decimals`), accepts
+Jinja templates, and opens its own more-info dialog on click. `sensors:` is the
+key; `entities:` works as an alias.
+
+- **The header row replaces the plain title line.** If it has no `title:` of
+  its own it inherits the top-level `title:`, so the title never renders twice.
+- **`show: false` hides a row entirely.** On the header row that hides the title
+  too — handy when the dashboard view already names the card.
+- The footer row is separated from the buttons by a divider line, and it only
+  appears when it has something to show.
+- Row sensors are subscribed like any other entity, but they are **not**
+  counted by the ["Xs ago" freshness line](#staleness-indicator) — an unrelated
+  slow sensor shouldn't make the UPS look stale.
+- `getCardSize()` accounts for both rows, so Lovelace reserves the height.
+
+The visual editor gives each row four sensor slots (the next appears once the
+previous names a sensor) and a **Show row** checkbox; YAML takes as many as you
+want.
+
 ## Buttons
 
 Added in **v0.6.0**. `buttons:` renders a strip under the diagram, three per
@@ -315,8 +402,11 @@ Other fields:
 - `color` — any CSS color; used for the on-state ring and icon instead of
   `--primary-color`.
 - `confirmation: true` — asks before firing, for anything that cuts the solar
-  input or restarts the unit. Pair it with `confirmation_text` to override the
-  question.
+  input or restarts the unit. Since **v0.7** the question uses the action verb,
+  so a toggle asks `Toggle Solar bypass?`, a more-info button asks `Open BMS?`,
+  a navigate button asks `Navigate to Energy?` and a service call asks
+  `Run Log?`. The label is the button's `name`, falling back to its service,
+  entity or target. Override it with `confirmation_text`.
 
 Buttons whose action is `toggle` or `more-info` light up with an accent ring
 while their entity is `on`, so a switched outlet reads its real state at a
@@ -440,6 +530,20 @@ buttons:
     icon: mdi:transmission-tower
     action: navigate
     navigation_path: /lovelace/energy
+  - name: Solar bypass
+    entity: switch.elite_200_v2_01_solar_pass
+    action: toggle
+    confirmation: true
+header:
+  sensors:
+    - entity: sensor.elite_200_v2_01_cabinet_temperature
+      label: Cabinet
+    - entity: sensor.elite_200_v2_01_cycle_count
+      decimals: 0
+footer:
+  sensors:
+    - entity: sensor.elite_200_v2_01_firmware
+      label: FW
 ```
 
 ## Theming
