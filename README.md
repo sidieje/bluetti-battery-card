@@ -64,10 +64,12 @@ The card ships with a Lovelace visual editor (added in **v0.3.0**). When you
 add the card via the dashboard's "Add card" picker, or edit an existing card
 and choose **Show visual editor**, you'll get an entity-picker form with
 collapsible sections for each corner, the unit, the center display, and the
-options. YAML mode still works for everything the editor exposes, plus
-anything Jinja that the editor's selectors don't render.
+options. Since v0.6 each corner section also holds two extra-reading slots, and
+the form grows up to six button sections as you fill them in. YAML mode still
+works for everything the editor exposes, plus anything Jinja that the editor's
+selectors don't render.
 
-### Schema (v0.5)
+### Schema (v0.6)
 
 ```yaml
 type: custom:integrated-ups-flow-card
@@ -78,6 +80,11 @@ pv:                          # optional — top-left corner
   entity: sensor.elite_200_v2_01_photovoltaics_input_power
   name: PV
   icon: mdi:solar-panel
+  readings:                  # optional — extra lines under the watts (v0.6)
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_voltage
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_current
+      label: I
+      decimals: 1
 grid:                        # optional — top-right corner
   entity: sensor.elite_200_v2_01_grid_input_power
   name: Grid
@@ -111,10 +118,23 @@ display:
   runtime_template: ~        # optional plain string or Jinja override
 
 options:
+  size: normal               # compact | normal | large (added in v0.6)
+  scale: 1                   # 0.4–2.2 fine-tune, multiplied by size (v0.6)
   idle_threshold: 5          # W deadband around zero (default 5)
   invert_battery_sign: false # flip if power_entity uses discharge-positive
   max_power: 2600            # W — used to scale flow animation speed
   stale_threshold: 300       # s — the "Xs ago" text turns red past this (added in v0.5)
+
+# Action buttons under the diagram (added in v0.6)
+buttons:
+  - name: AC outlet
+    icon: mdi:power-plug
+    entity: switch.elite_200_v2_01_ac_outlet
+    action: toggle
+  - name: Energy
+    icon: mdi:transmission-tower
+    action: navigate
+    navigation_path: /lovelace/energy
 ```
 
 ### Field reference
@@ -130,6 +150,7 @@ options:
 | `dc.name` / `dc.icon` | no | Defaults: `DC` / `mdi:current-dc`. |
 | `ac.entity` | no | AC output watts. (`load.entity` from v0.1 still accepted as an alias.) Omit to hide the AC corner and its flow line. |
 | `ac.name` / `ac.icon` | no | Defaults: `AC` / `mdi:power-plug`. |
+| `<corner>.readings` | no | List of extra sensors shown under the corner's watts (see [Extra readings](#extra-readings)). Added in v0.6. |
 | `unit.soc_entity` | no | Battery SoC 0–100. Drives the arc fill and SoC text. Recommended. |
 | `unit.power_entity` | no | Battery throughput in watts. Positive = charging, negative = discharging. Most integrations don't expose this — leave empty and the card derives `(grid + pv) − (ac + dc)`. |
 | `display.show_state` | no | Show the charging / discharging / idle label inside the arc. Default `true`. |
@@ -141,10 +162,24 @@ options:
 | `display.state_template` | no | Override the state label. Accepts either a plain string or a Jinja template. |
 | `display.throughput_template` | no | Override the throughput line. Plain string or Jinja template. |
 | `display.runtime_template` | no | Override the runtime line. Plain string or Jinja template. |
+| `options.size` | no | `compact` (0.72×), `normal` (1×) or `large` (1.25×). Default `normal`. See [Sizing](#sizing). |
+| `options.scale` | no | Free multiplier from `0.4` to `2.2`, applied on top of `size`. Default `1`. |
 | `options.idle_threshold` | no | Watts deadband used for active/idle decisions. Default `5`. |
 | `options.invert_battery_sign` | no | Set `true` if your `power_entity` reports discharge as positive. |
 | `options.max_power` | no | Watts used as the upper bound for animation-speed scaling. Default `2600`. |
 | `options.stale_threshold` | no | Seconds since the newest reading before the "Xs ago" text turns red. Text color only — the card's red border is driven separately, by the battery-level entity going `unavailable`. Default `300`. |
+| `buttons` | no | List of buttons rendered in a strip under the diagram (see [Buttons](#buttons)). Added in v0.6. |
+
+#### Reading entries
+
+Each entry in a corner's `readings:` list:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `entity` | yes | Sensor to display. Also accepts a Jinja template. |
+| `label` | no | Short prefix rendered before the value (`V`, `I`, `W`). Omit to show the value alone. |
+| `unit` | no | Unit suffix. Defaults to the sensor's own `unit_of_measurement`; set it to `""` to suppress the unit entirely. |
+| `decimals` | no | Round the value to this many decimals (0–4). Default `1`. |
 
 ### Templates
 
@@ -177,6 +212,118 @@ clickable and opens Home Assistant's standard more-info dialog for the
 configured entity — `pv.entity`, `grid.entity`, `dc.entity`, `ac.entity`, and
 `unit.soc_entity` respectively. Corners whose entity is configured as a Jinja
 template are non-clickable (a template doesn't map to a single entity).
+
+## Sizing
+
+Added in **v0.6.0**. The whole card — corners, battery circle, fonts, icons,
+flow lines and the center stack — scales from one knob, so shrinking it never
+breaks the layout.
+
+```yaml
+options:
+  size: compact   # compact | normal | large
+  scale: 0.9      # optional fine-tune, 0.4 – 2.2
+```
+
+| `size` | Multiplier |
+| --- | --- |
+| `compact` | 0.72× |
+| `normal` (default) | 1× |
+| `large` | 1.25× |
+
+`scale` is multiplied on top of the preset, so `size: compact` with
+`scale: 1.2` lands at ~0.86×. The product is clamped to 0.4–2.2.
+
+Below 560 px of card width an extra 0.82× is applied automatically, so the same
+config stays readable in a narrow dashboard column.
+
+Lovelace reserves vertical space from the card's measured height, so a compact
+card asks for about five rows where a normal one asks for seven. If a browser
+still clips it, pin the height explicitly with
+`view_layout: { grid_rows: 7 }`.
+
+## Extra readings
+
+Added in **v0.6.0**. Any corner can carry extra sensors under its watts — the
+usual ask being PV voltage and current:
+
+```yaml
+pv:
+  entity: sensor.elite_200_v2_01_photovoltaics_input_power
+  readings:
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_voltage
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_current
+      label: I
+      decimals: 1
+```
+
+which renders as `238.4 V` and `I 4.6 A` under the PV power line. See the
+[reading entry reference](#reading-entries) for the fields.
+
+Readings inherit the corner's behaviour: each one opens its own more-info
+dialog on click, they count towards the "Xs ago" freshness line, and their
+`entity` fields accept Jinja templates like every other field. A reading whose
+sensor goes `unavailable` shows `—`.
+
+The visual editor exposes two reading slots per corner; a second slot appears
+once the first names a sensor. YAML takes as many as you want.
+
+## Buttons
+
+Added in **v0.6.0**. `buttons:` renders a strip under the diagram, three per
+row:
+
+```yaml
+buttons:
+  - name: AC outlet
+    icon: mdi:power-plug
+    entity: switch.elite_200_v2_01_ac_outlet
+    action: toggle
+  - name: Solar bypass
+    entity: switch.elite_200_v2_01_solar_pass
+    action: toggle
+    confirmation: true
+  - name: Energy
+    icon: mdi:transmission-tower
+    action: navigate
+    navigation_path: /lovelace/energy
+```
+
+The strip is a fixed height, so the row count decides how tall each button is:
+three buttons fill it, six split it into two half-height rows, and seven or
+more keep the half-height rows and grow the strip so they stay tappable.
+
+| `action` | Extra fields | Behaviour |
+| --- | --- | --- |
+| `toggle` | `entity` | Calls `<domain>.toggle` on the entity. |
+| `more-info` | `entity` | Opens the standard more-info dialog. |
+| `call-service` | `service`, `service_data` | Calls `service` (e.g. `notify.persist_notification`) with `service_data`. `entity` is injected into the data if you don't set it yourself. |
+| `navigate` | `navigation_path` | In-app navigation, e.g. `/lovelace/energy`. |
+| `url` | `url` | Opens an external URL in a new tab. |
+| `none` | — | Renders the button inert (useful as a spacer or label). |
+
+`action` is optional and inferred from what you did provide: `service` →
+`call-service`, `navigation_path` → `navigate`, `url` → `url`, `entity` alone →
+`more-info`, otherwise `toggle`.
+
+Other fields:
+
+- `name` — label. Defaults to a humanized version of the entity's object ID
+  (`switch.ac_outlet` → "Ac outlet"), falling back to the action name.
+- `icon` — MDI icon. Defaults to the entity's own icon when it has one, then to
+  one that matches the entity's domain or the action.
+- `color` — any CSS color; used for the on-state ring and icon instead of
+  `--primary-color`.
+- `confirmation: true` — asks before firing, for anything that cuts the solar
+  input or restarts the unit. Pair it with `confirmation_text` to override the
+  question.
+
+Buttons whose action is `toggle` or `more-info` light up with an accent ring
+while their entity is `on`, so a switched outlet reads its real state at a
+glance.
+
+The visual editor offers six button slots; the next slot appears once the
+previous one has any content. YAML takes as many as you want.
 
 ## Staleness indicator
 
@@ -254,6 +401,11 @@ pv:
   entity: sensor.elite_200_v2_01_photovoltaics_input_power
   name: PV
   icon: mdi:solar-panel
+  readings:
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_voltage
+    - entity: sensor.elite_200_v2_01_photovoltaics_input_current
+      label: I
+      decimals: 1
 grid:
   entity: sensor.elite_200_v2_01_grid_input_power
   name: Grid
@@ -272,8 +424,22 @@ display:
   runtime_entity: sensor.elite_200_v2_01_battery_time_in_minutes
   charge_time_entity: sensor.elite_200_v2_01_full_charge_time_in_minutes
 options:
+  size: compact
   idle_threshold: 5
   max_power: 2600
+buttons:
+  - name: AC outlet
+    icon: mdi:power-plug
+    entity: switch.elite_200_v2_01_ac_outlet
+    action: toggle
+  - name: DC outlet
+    icon: mdi:current-dc
+    entity: switch.elite_200_v2_01_dc_outlet
+    action: toggle
+  - name: Energy
+    icon: mdi:transmission-tower
+    action: navigate
+    navigation_path: /lovelace/energy
 ```
 
 ## Theming

@@ -25,6 +25,13 @@ state-of-charge gauge. Flow lines animate when their input/output is active.
   readings go stale, plus a red card border when the battery-level entity goes
   unavailable
 - Optional DC and PV corners — show "—" when not configured
+- Configurable size — `compact` / `normal` / `large` presets plus a 0.4–2.2
+  scale slider, with everything (fonts, icons, gauge, flow lines) scaling
+  together
+- Action-button strip under the diagram — toggle, more-info, call-service,
+  navigate or URL actions, laid out three per row
+- Extra readings per corner (e.g. PV voltage and current), with units taken
+  from the sensor and click-through to more-info
 - Backward-compatible: v0.1 configs using `load:` are accepted and rendered as
   the AC corner
 
