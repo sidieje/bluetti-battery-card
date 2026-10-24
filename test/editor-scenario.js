@@ -13,9 +13,14 @@ const EDITOR_CONFIG = {
     readings: [{ entity: 'sensor.pv_voltage', label: 'V', decimals: 1 }],
   },
   options: { size: 'compact', scale: 0.9 },
+  header: {
+    title: 'Home UPS',
+    sensors: [{ entity: 'sensor.room_temp', label: 'Room' }],
+  },
+  footer: { show: false },
   buttons: [
     { entity: 'switch.fan', name: 'Fan' },
-    { entity: 'switch.pump', name: 'Pump' },
+    { entity: 'switch.pump', name: 'Pump', confirmation: true },
   ],
 };
 
@@ -38,6 +43,11 @@ async function runEditorTests(opts) {
   const check = (label, ok, extra) => {
     if (ok) { pass++; log('  ok   ' + label, 'pass'); } else { fail++; log('  FAIL ' + label + (extra ? ' -> ' + extra : ''), 'fail'); }
   };
+  // Lovelace feeds each emitted config back into the editor; --no-recall skips
+  // that, so the form is never re-rendered after a schema change and fields
+  // that only appear for a new action do not exist yet. Those checks are
+  // recall-only.
+  const checkR = (label, ok, extra) => { if (recall) check(label, ok, extra); };
   const tick = () => new Promise((r) => setTimeout(r, 0));
   const flush = async (n) => { for (let i = 0; i < (n || 6); i++) await tick(); };
 
@@ -63,6 +73,20 @@ async function runEditorTests(opts) {
     input.dispatchEvent(new Event('input', { bubbles: true }));
     await flush();
     return input;
+  };
+  const setCheck = async (expandable, name, checked) => {
+    const input = fieldInput(expandable, name);
+    if (!input) return null;
+    input.checked = checked;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await flush();
+    return input;
+  };
+  const fieldLabel = (expandable, name) => {
+    if (!expandable || !expandable._form) return null;
+    const entry = expandable._form._items.find((it) => it.el._schema && it.el._schema.name === name);
+    const lbl = entry && entry.el.shadowRoot && entry.el.shadowRoot.querySelector('.lbl');
+    return lbl ? lbl.textContent : null;
   };
 
   const hass = { states: {}, callService: async () => {}, localize: () => '' };
@@ -143,13 +167,60 @@ async function runEditorTests(opts) {
   const act = await type(b1, 'action', 'call-service');
   check('action set to call-service', act && act.value === 'call-service', act && act.value);
   const b1b = section('Button 1');
-  check('service field now offered', Boolean(fieldInput(b1b, 'service')));
+  checkR('service field now offered', Boolean(fieldInput(b1b, 'service')));
   check('name survived the schema change', fieldInput(b1b, 'name').value === 'Fan room 2', JSON.stringify(fieldInput(b1b, 'name').value));
   await type(b1b, 'service', 'switch.turn_on');
   const after2 = configs[configs.length - 1];
   log('emitted buttons: ' + JSON.stringify(after2.buttons));
-  check('button1 has service + name + action', after2.buttons[0].service === 'switch.turn_on' && after2.buttons[0].name === 'Fan room 2' && after2.buttons[0].action === 'call-service', JSON.stringify(after2.buttons[0]));
+  check('button1 has name + action', after2.buttons[0].name === 'Fan room 2' && after2.buttons[0].action === 'call-service', JSON.stringify(after2.buttons[0]));
+  checkR('button1 kept the service typed after the schema change', after2.buttons[0].service === 'switch.turn_on', JSON.stringify(after2.buttons[0]));
   check('button2 untouched by button1 edit', after2.buttons[1].name === 'Pump house' && after2.buttons[1].entity === 'switch.pump', JSON.stringify(after2.buttons[1]));
+
+  log('');
+  log('--- 7. header / footer rows ---');
+  const hdr = section('Header row (title + sensors)');
+  check('header section exists', Boolean(hdr));
+  check('footer section exists', Boolean(section('Footer row (sensors)')));
+  if (hdr) {
+    check('header title prefills', fieldInput(hdr, 'title').value === 'Home UPS', JSON.stringify(fieldInput(hdr, 'title').value));
+    check('header title field relabelled', fieldLabel(hdr, 'title') === 'Header title', JSON.stringify(fieldLabel(hdr, 'title')));
+    check('header sensor1 prefills', fieldInput(hdr, 'sensor1_entity').value === 'sensor.room_temp', JSON.stringify(fieldInput(hdr, 'sensor1_entity').value));
+    check('header show prefills checked', fieldInput(hdr, 'show').checked === true, JSON.stringify(fieldInput(hdr, 'show').checked));
+    await type(hdr, 'sensor2_entity', 'sensor.firmware');
+    const after7 = configs[configs.length - 1];
+    log('emitted header: ' + JSON.stringify(after7.header));
+    check('header kept its title', after7.header && after7.header.title === 'Home UPS', JSON.stringify(after7.header));
+    check('header sensor1 intact after adding sensor2', after7.header.sensors[0].entity === 'sensor.room_temp' && after7.header.sensors[0].label === 'Room', JSON.stringify(after7.header.sensors));
+    check('header sensor2 added', after7.header.sensors.length === 2 && after7.header.sensors[1].entity === 'sensor.firmware', JSON.stringify(after7.header.sensors));
+    check('no row slot keys leak', !('sensor1_entity' in after7.header), JSON.stringify(Object.keys(after7.header)));
+  }
+  const ftr = section('Footer row (sensors)');
+  if (ftr) {
+    check('footer show unchecked when hidden', fieldInput(ftr, 'show').checked === false, JSON.stringify(fieldInput(ftr, 'show').checked));
+    await setCheck(ftr, 'show', true);
+    const after7b = configs[configs.length - 1];
+    log('emitted footer: ' + JSON.stringify(after7b.footer));
+    check('empty footer block is not written', after7b.footer === undefined, JSON.stringify(after7b.footer));
+    const ftr2 = section('Footer row (sensors)');
+    await type(ftr2, 'sensor1_entity', 'sensor.co2');
+    const after7c = configs[configs.length - 1];
+    check('footer sensor added, no show flag', after7c.footer && JSON.stringify(after7c.footer) === JSON.stringify({ sensors: [{ entity: 'sensor.co2' }] }), JSON.stringify(after7c.footer));
+    const ftr3 = section('Footer row (sensors)');
+    await setCheck(ftr3, 'show', false);
+    const after7d = configs[configs.length - 1];
+    check('hiding the footer keeps its sensors', after7d.footer && after7d.footer.show === false && after7d.footer.sensors.length === 1 && after7d.footer.sensors[0].entity === 'sensor.co2', JSON.stringify(after7d.footer));
+  }
+  if (step < 7) return { lines, pass, fail };
+
+  log('');
+  log('--- 8. confirmation text ---');
+  const b2b = section('Button 2');
+  check('confirmation_text offered when confirmation is on', Boolean(fieldInput(b2b, 'confirmation_text')));
+  await type(b2b, 'confirmation_text', 'Stop the pump?');
+  const after8 = configs[configs.length - 1];
+  check('confirmation_text saved', after8.buttons[1].confirmation_text === 'Stop the pump?', JSON.stringify(after8.buttons[1]));
+  check('button2 kept its confirmation flag', after8.buttons[1].confirmation === true, JSON.stringify(after8.buttons[1]));
+  checkR('button1 untouched by the confirmation edit', after8.buttons[0].name === 'Fan room 2' && after8.buttons[0].service === 'switch.turn_on', JSON.stringify(after8.buttons[0]));
 
   log('');
   log(fail === 0 ? 'ALL PASS' : 'FAILURES', fail === 0 ? 'pass' : 'fail');

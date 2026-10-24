@@ -9,12 +9,13 @@
      * Simulates the Home Assistant frontend just enough to render the card
      * without a real HA instance:
      *   - Stub <ha-card> / <ha-icon> custom elements.
-     *   - Mock hass with the elite_200_v2_01 sensors at nine scenarios:
+     *   - Mock hass with the elite_200_v2_01 sensors at twelve scenarios:
      *     charging-from-grid, discharging-to-ac, solar-charging, idle, a stale
      *     case whose entities last reported 6 min ago (red "ago" text only),
      *     a battery-unavailable case (red ring + dimmed readings), a compact
-     *     card with extra PV readings, and two button-strip cases (3 buttons
-     *     full height, 6 buttons in two half-height rows).
+     *     card with extra PV readings, two button-strip cases (3 buttons full
+     *     height, 6 buttons in two half-height rows), and three v0.7 cases
+     *     (header + footer sensor rows, a hidden header, compact with rows).
      *   - Mounts each scenario in its own container.
      */
     :root {
@@ -64,13 +65,16 @@
   <div class="page">
     <h1>integrated-ups-flow-card — local test harness</h1>
     <p class="sub">
-      Renders nine scenarios with mock hass data — no Home Assistant required.
+      Renders twelve scenarios with mock hass data — no Home Assistant required.
       You should see four corners (PV top-left, Grid top-right, DC bottom-left,
       AC bottom-right) with the SoC arc in the middle. Active flows animate
-      with a colored dash traveling along the line. The last three cards cover
-      the v0.6 additions: <code>options.size</code> with per-corner
-      <code>readings:</code>, and the <code>buttons:</code> strip (click the
-      buttons — toggles flip the mock switch state).
+      with a colored dash traveling along the line. The last six cards cover
+      the v0.6 additions (<code>options.size</code> with per-corner
+      <code>readings:</code>, and the <code>buttons:</code> strip — click the
+      buttons, toggles flip the mock switch state) plus the v0.7 additions: the
+      <code>header:</code> / <code>footer:</code> sensor rows, and text that
+      stays at normal size in compact mode. The console prints a layout
+      self-check and logs every confirmation prompt.
     </p>
     <div class="grid">
       <div class="scenario">
@@ -108,6 +112,18 @@
       <div class="scenario">
         <h2>Six buttons (two half-height rows)</h2>
         <div id="card-buttons6"></div>
+      </div>
+      <div class="scenario">
+        <h2>Header + footer sensor rows (title and extra sensors)</h2>
+        <div id="card-rows"></div>
+      </div>
+      <div class="scenario">
+        <h2>Header row hidden (show: false removes the title too)</h2>
+        <div id="card-rows-hidden"></div>
+      </div>
+      <div class="scenario">
+        <h2>Compact size with rows — text stays at normal size</h2>
+        <div id="card-compact-rows"></div>
       </div>
     </div>
   </div>
@@ -183,6 +199,12 @@
           // Extra readings for the compact scenario (unit auto-detected).
           'sensor.elite_200_v2_01_photovoltaics_input_voltage': mk('sensor.elite_200_v2_01_photovoltaics_input_voltage', volt, 'V'),
           'sensor.elite_200_v2_01_photovoltaics_input_current': mk('sensor.elite_200_v2_01_photovoltaics_input_current', amps, 'A'),
+          // Sensors for the header / footer rows (outside the power flow).
+          'sensor.elite_200_v2_01_cabinet_temperature': mk('sensor.elite_200_v2_01_cabinet_temperature', 31.6, '°C'),
+          'sensor.elite_200_v2_01_cycle_count': mk('sensor.elite_200_v2_01_cycle_count', 118, 'cycles'),
+          'sensor.elite_200_v2_01_firmware': mk('sensor.elite_200_v2_01_firmware', '1.2.4', null),
+          'sensor.house_living_room_temperature': mk('sensor.house_living_room_temperature', 21.4, '°C'),
+          'sensor.house_co2': mk('sensor.house_co2', 742, 'ppm'),
           // Targets for the button strip.
           'switch.elite_200_v2_01_ac_outlet': mk('switch.elite_200_v2_01_ac_outlet', 'on', null),
           'switch.elite_200_v2_01_dc_outlet': mk('switch.elite_200_v2_01_dc_outlet', 'off', null),
@@ -288,6 +310,67 @@
             ],
           },
         },
+        // v0.7: the header row carries the title plus sensors that have nothing
+        // to do with the power flow; the footer row sits under the button strip.
+        {
+          id: 'card-rows',
+          state: { pv: 1100, grid: 0, dc: 40, ac: 250, soc: 65, runtime: 0, volt: 236.1, amps: 4.66 },
+          config: {
+            header: {
+              title: 'Elite 200 V2 — home UPS',
+              sensors: [
+                { entity: 'sensor.elite_200_v2_01_cabinet_temperature', label: 'Cabinet' },
+                { entity: 'sensor.elite_200_v2_01_cycle_count', decimals: 0 },
+                { entity: 'sensor.elite_200_v2_01_firmware' },
+              ],
+            },
+            pv: {
+              ...baseConfig.pv,
+              readings: [
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_voltage' },
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_current', label: 'I', decimals: 1 },
+              ],
+            },
+            footer: {
+              sensors: [
+                { entity: 'sensor.house_living_room_temperature', label: 'Living room' },
+                { entity: 'sensor.house_co2', label: 'CO2', decimals: 0 },
+              ],
+            },
+            buttons: [
+              { name: 'AC outlet', icon: 'mdi:power-plug', entity: 'switch.elite_200_v2_01_ac_outlet', action: 'toggle' },
+              // Confirmation prompt should read "Toggle DC outlet?".
+              { name: 'DC outlet', icon: 'mdi:current-dc', entity: 'switch.elite_200_v2_01_dc_outlet', action: 'toggle', confirmation: true },
+            ],
+          },
+        },
+        // header.show: false hides the whole row — the card title goes with it.
+        {
+          id: 'card-rows-hidden',
+          state: { pv: 0, grid: 1407, dc: 0, ac: 312, soc: 80, runtime: 60 },
+          config: { header: { show: false } },
+        },
+        // Compact preset: the layout shrinks, the text does not. Clicking DC
+        // asks "Toggle DC?" rather than "Run DC?".
+        {
+          id: 'card-compact-rows',
+          state: { pv: 1100, grid: 0, dc: 40, ac: 250, soc: 65, runtime: 0, volt: 236.1, amps: 4.66 },
+          config: {
+            options: { ...baseConfig.options, size: 'compact' },
+            header: { sensors: [{ entity: 'sensor.elite_200_v2_01_cabinet_temperature', label: 'Cabinet' }] },
+            footer: { sensors: [{ entity: 'sensor.house_co2', label: 'CO2', decimals: 0 }] },
+            pv: {
+              ...baseConfig.pv,
+              readings: [
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_voltage' },
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_current', label: 'I', decimals: 1 },
+              ],
+            },
+            buttons: [
+              { name: 'DC', icon: 'mdi:current-dc', entity: 'switch.elite_200_v2_01_dc_outlet', action: 'toggle', confirmation: true },
+            ],
+          },
+        },
       ];
       for (const s of scenarios) {
         const host = document.getElementById(s.id);
@@ -311,15 +394,72 @@
       console.log('[mock hass] hass-navigate ->', ev.detail && ev.detail.path);
     });
 
-    // The six-button scenario has one `confirmation: true` button. Auto-accept
-    // so the harness never blocks on a native dialog.
+    /* Layout self-check — prints the numbers worth eyeballing, and fails loudly
+       if a v0.7 feature is missing. Run: open the console on this page. */
+    function report() {
+      const cardOf = (id) => document.getElementById(id).querySelector('integrated-ups-flow-card');
+      const row = (id, cls) => cardOf(id).shadowRoot.querySelector(cls);
+      const shown = (el) => Boolean(el) && getComputedStyle(el).display !== 'none';
+      const results = [];
+      const check = (label, ok, extra) => results.push(`${ok ? 'ok  ' : 'FAIL'} ${label}${extra === undefined || extra === null ? '' : ' -> ' + extra}`);
+
+      const header = row('card-rows', '.ups-row--header');
+      const footer = row('card-rows', '.ups-row--footer');
+      const buttons = row('card-rows', '.ups-buttons');
+      check('header row renders', shown(header));
+      check('footer row renders', shown(footer));
+      check('header title overrides the card title', header && header.querySelector('.ups-row__title').textContent === 'Elite 200 V2 — home UPS', header && header.querySelector('.ups-row__title').textContent);
+      check('header shows three sensors', header && header.querySelectorAll('.ups-row__sensor').length === 3, header && header.querySelectorAll('.ups-row__sensor').length);
+      check('footer shows two sensors', footer && footer.querySelectorAll('.ups-row__sensor').length === 2, footer && footer.querySelectorAll('.ups-row__sensor').length);
+      check('footer sits below the button strip', Boolean(header && buttons && footer && footer.compareDocumentPosition(buttons) & Node.DOCUMENT_POSITION_PRECEDING));
+      check('footer is divided from the buttons', footer && parseFloat(getComputedStyle(footer).borderTopWidth) > 0, footer && getComputedStyle(footer).borderTopWidth);
+      check('header is spaced from the flow', header && parseFloat(getComputedStyle(header).marginBottom) > 0, header && getComputedStyle(header).marginBottom);
+
+      check('header.show:false hides the row', !shown(row('card-rows-hidden', '.ups-row--header')));
+
+      // Text must not shrink with the compact preset: only the layout does.
+      const normalIds = ['card-charge', 'card-discharge', 'card-solar', 'card-idle', 'card-stale', 'card-unavail', 'card-rows', 'card-rows-hidden'];
+      const compactIds = ['card-compact', 'card-compact-rows'];
+      const maxFont = (ids, sel) => {
+        let max = null;
+        for (const id of ids) {
+          const el = cardOf(id).shadowRoot.querySelector(sel);
+          if (!el) continue;
+          const v = parseFloat(getComputedStyle(el).fontSize);
+          if (max === null || v > max) max = v;
+        }
+        return max;
+      };
+      for (const sel of ['.corner__power', '.corner__name', '.corner__reading', '.ups-row__title', '.ups-row__sensor']) {
+        const a = maxFont(normalIds, sel);
+        const b = maxFont(compactIds, sel);
+        check(`compact ${sel} text is not smaller than normal`, a !== null && b !== null && b >= a - 0.01, `${a}px vs ${b}px`);
+      }
+      // The SoC readout does scale with the battery circle (floored at 0.85).
+      const socA = maxFont(normalIds, '.battery-soc');
+      const socB = maxFont(compactIds, '.battery-soc');
+      check('compact SoC scales down but stays legible', socB !== null && socB < socA && socB >= socA * 0.84, `${socA}px vs ${socB}px`);
+      // Compact card must be shorter than the normal one.
+      const hA = cardOf('card-charge').getBoundingClientRect().height;
+      const hB = cardOf('card-compact').getBoundingClientRect().height;
+      check('compact card is shorter', hB < hA, `${Math.round(hB)}px vs ${Math.round(hA)}px`);
+
+      for (const line of results) console.log(line);
+      window.__upsReport = results;
+      return results;
+    }
+
+    // Several scenarios have `confirmation: true` buttons. Auto-accept so the
+    // harness never blocks on a native dialog; the prompt text is logged so the
+    // action-aware wording ("Toggle DC?" not "Run DC?") can be checked.
     window.confirm = (message) => {
       console.log('[mock hass] confirm ->', message);
       return true;
     };
 
-    if (customElements.get('integrated-ups-flow-card')) mountAll();
-    else customElements.whenDefined('integrated-ups-flow-card').then(mountAll);
+    const mounted = () => { mountAll(); requestAnimationFrame(() => requestAnimationFrame(report)); };
+    if (customElements.get('integrated-ups-flow-card')) mounted();
+    else customElements.whenDefined('integrated-ups-flow-card').then(mounted);
   </script>
 </body>
 </html>
