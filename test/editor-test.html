@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Editor harness - mini ha-form</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; background: #f6f7f9; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  p.lede { color: #666; margin-top: 0; max-width: 70ch; }
+  .row { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  #form { width: 430px; background: #fff; border: 1px solid #dcdfe4; border-radius: 10px; padding: 12px; }
+  #log { flex: 1 1 520px; min-width: 480px; font: 12px/1.55 ui-monospace, Consolas, monospace; white-space: pre-wrap; background: #10161d; color: #d8e6f2; padding: 14px; border-radius: 10px; margin: 0; }
+  #log .pass { color: #7ee787; }
+  #log .fail { color: #ff7b72; }
+  mini-expandable { display: block; margin: 8px 0; border: 1px solid #dcdfe4; border-radius: 8px; }
+  mini-expandable .hdr { padding: 8px 10px; font-weight: 600; cursor: pointer; background: #f2f4f7; }
+  mini-expandable .body { padding: 8px 10px; }
+  mini-selector { display: block; margin: 6px 0; }
+  mini-selector .lbl { display: block; font-size: 11px; color: #555; }
+  mini-selector input, mini-selector select { width: 100%; padding: 6px; border: 1px solid #c8ccd2; border-radius: 6px; font: inherit; }
+  button { padding: 6px 10px; margin: 4px 6px 4px 0; font: inherit; }
+</style>
+</head>
+<body>
+<h1>Visual editor harness</h1>
+<p class="lede">
+  Replays the parts of Home Assistant's <code>ha-form</code> that the card editor depends on
+  (<code>getValue</code> nesting, field elements reused by index, the
+  <code>value-changed</code> merge that wraps a named section's value under its
+  <code>name</code>, and lit's "only commit a bound property when it changed" rule), so the
+  editor can be driven and asserted without a running Home Assistant.
+  The same scenario runs headless: <code>node test/editor-node-test.mjs</code>.
+</p>
+<div class="row">
+  <div id="form"></div>
+  <div>
+    <button id="btn-reload">Re-run tests</button>
+    <button id="btn-open">Expand all sections</button>
+    <pre id="log"></pre>
+  </div>
+</div>
+
+<script src="../integrated-ups-flow-card.js"></script>
+<script src="mini-ha-form.js"></script>
+<script src="editor-scenario.js"></script>
+<script>
+  const params = new URLSearchParams(location.search);
+  const opts = {
+    el: document.getElementById('log'),
+    step: params.has('step') ? Number(params.get('step')) : 99,
+    recall: !params.has('no-recall'),
+  };
+  const run = async () => {
+    document.getElementById('log').textContent = '';
+    const r = await runEditorTests(opts);
+    window.__done = true;
+    window.__failed = r.fail;
+    window.__log = document.getElementById('log').textContent;
+  };
+  const deepAll = (sel) => {
+    const out = [];
+    const walk = (root) => {
+      for (const el of root.querySelectorAll('*')) {
+        if (el.matches(sel)) out.push(el);
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    walk(document);
+    return out;
+  };
+  document.getElementById('btn-reload').addEventListener('click', run);
+  document.getElementById('btn-open').addEventListener('click', () =>
+    deepAll('mini-expandable').forEach((s) => { s._open = true; s._paint(); }));
+  run();
+</script>
+</body>
+</html>

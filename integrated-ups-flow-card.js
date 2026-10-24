@@ -39,7 +39,7 @@
  * ask — whose units default to the sensor's own.
  */
 
-const CARD_VERSION = '0.6.0';
+const CARD_VERSION = '0.6.1';
 const CARD_TAG = 'integrated-ups-flow-card';
 const EDITOR_TAG = `${CARD_TAG}-editor`;
 
@@ -1980,23 +1980,31 @@ function configToFormSlots(config) {
   for (const key of CORNER_KEYS) {
     if (!c[key] || typeof c[key] !== 'object') continue;
     const corner = { ...c[key] };
-    const readings = Array.isArray(corner.readings) ? corner.readings : [];
-    for (let i = 0; i < MAX_EDITOR_READINGS; i++) {
-      const r = readings[i] || {};
-      corner[`reading${i + 1}_entity`] = r.entity ?? '';
-      corner[`reading${i + 1}_label`] = r.label ?? '';
-      corner[`reading${i + 1}_unit`] = r.unit ?? '';
-      corner[`reading${i + 1}_decimals`] = Number.isFinite(r.decimals) ? r.decimals : undefined;
+    // Only re-expand from the array when the array is present. Feeding an
+    // already-expanded config back in must keep what the user typed.
+    if (Array.isArray(corner.readings)) {
+      for (let i = 0; i < MAX_EDITOR_READINGS; i++) {
+        const r = corner.readings[i] || {};
+        corner[`reading${i + 1}_entity`] = r.entity ?? '';
+        corner[`reading${i + 1}_label`] = r.label ?? '';
+        corner[`reading${i + 1}_unit`] = r.unit ?? '';
+        corner[`reading${i + 1}_decimals`] = Number.isFinite(r.decimals) ? r.decimals : undefined;
+      }
+      delete corner.readings;
     }
-    delete corner.readings;
+    for (let i = 1; i <= MAX_EDITOR_READINGS; i++) {
+      if (corner[`reading${i}_entity`] === undefined) corner[`reading${i}_entity`] = '';
+    }
     c[key] = corner;
   }
 
-  const buttons = Array.isArray(c.buttons) ? c.buttons : [];
+  const buttons = Array.isArray(c.buttons) ? c.buttons : null;
   for (let i = 0; i < MAX_EDITOR_BUTTONS; i++) {
-    c[`button${i + 1}`] = { ...(buttons[i] || {}) };
+    const key = `button${i + 1}`;
+    if (buttons) c[key] = { ...(buttons[i] || {}) };
+    else if (!c[key] || typeof c[key] !== 'object') c[key] = {};
   }
-  delete c.buttons;
+  if (buttons) delete c.buttons;
 
   return c;
 }
@@ -2299,8 +2307,11 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
     c.unit = unit;
     c.display = display;
 
-    // The form works with fixed reading/button slots; YAML stores arrays.
-    return configToFormSlots(c);
+    // Keep `_config` in its YAML (array) form. `_render` expands it into the
+    // form's fixed reading/button slots; expanding here too would run the
+    // expansion twice, and the second pass would wipe every slot because the
+    // first one already deleted the `readings:`/`buttons:` arrays.
+    return c;
   }
 
   _render() {
