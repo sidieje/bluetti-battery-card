@@ -9,10 +9,12 @@
      * Simulates the Home Assistant frontend just enough to render the card
      * without a real HA instance:
      *   - Stub <ha-card> / <ha-icon> custom elements.
-     *   - Mock hass with the elite_200_v2_01 sensors at six scenarios:
+     *   - Mock hass with the elite_200_v2_01 sensors at nine scenarios:
      *     charging-from-grid, discharging-to-ac, solar-charging, idle, a stale
      *     case whose entities last reported 6 min ago (red "ago" text only),
-     *     and a battery-unavailable case (red ring + dimmed readings).
+     *     a battery-unavailable case (red ring + dimmed readings), a compact
+     *     card with extra PV readings, and two button-strip cases (3 buttons
+     *     full height, 6 buttons in two half-height rows).
      *   - Mounts each scenario in its own container.
      */
     :root {
@@ -62,10 +64,13 @@
   <div class="page">
     <h1>integrated-ups-flow-card — local test harness</h1>
     <p class="sub">
-      Renders six scenarios with mock hass data — no Home Assistant required.
+      Renders nine scenarios with mock hass data — no Home Assistant required.
       You should see four corners (PV top-left, Grid top-right, DC bottom-left,
       AC bottom-right) with the SoC arc in the middle. Active flows animate
-      with a colored dash traveling along the line.
+      with a colored dash traveling along the line. The last three cards cover
+      the v0.6 additions: <code>options.size</code> with per-corner
+      <code>readings:</code>, and the <code>buttons:</code> strip (click the
+      buttons — toggles flip the mock switch state).
     </p>
     <div class="grid">
       <div class="scenario">
@@ -91,6 +96,18 @@
       <div class="scenario">
         <h2>Battery unavailable (red ring + dimmed readings)</h2>
         <div id="card-unavail"></div>
+      </div>
+      <div class="scenario">
+        <h2>Compact size + PV voltage/current readings</h2>
+        <div id="card-compact"></div>
+      </div>
+      <div class="scenario">
+        <h2>Three buttons (full-height row)</h2>
+        <div id="card-buttons3"></div>
+      </div>
+      <div class="scenario">
+        <h2>Six buttons (two half-height rows)</h2>
+        <div id="card-buttons6"></div>
       </div>
     </div>
   </div>
@@ -144,7 +161,7 @@
     customElements.define('ha-icon', HaIconStub);
 
     /* Mock hass */
-    function makeHass({ pv, grid, dc, ac, soc, runtime, ageSec = 0 }) {
+    function makeHass({ pv, grid, dc, ac, soc, runtime, ageSec = 0, volt = 0, amps = 0, onChange }) {
       // Stamp every entity as last reporting `ageSec` seconds ago so the
       // card's freshness indicator has something to measure. A live BLUETTI
       // poll keeps this small; the stale scenario pushes it past the default
@@ -155,7 +172,7 @@
         attributes: { unit_of_measurement: unit, friendly_name: id },
         last_reported: ts, last_updated: ts, last_changed: ts,
       });
-      return {
+      const hass = {
         states: {
           'sensor.elite_200_v2_01_photovoltaics_input_power': mk('sensor.elite_200_v2_01_photovoltaics_input_power', pv, 'W'),
           'sensor.elite_200_v2_01_grid_input_power': mk('sensor.elite_200_v2_01_grid_input_power', grid, 'W'),
@@ -163,12 +180,32 @@
           'sensor.elite_200_v2_01_alternating_current_out_power': mk('sensor.elite_200_v2_01_alternating_current_out_power', ac, 'W'),
           'sensor.elite_200_v2_01_battery_level': mk('sensor.elite_200_v2_01_battery_level', soc, '%'),
           'sensor.elite_200_v2_01_battery_time_in_minutes': mk('sensor.elite_200_v2_01_battery_time_in_minutes', runtime, 'min'),
+          // Extra readings for the compact scenario (unit auto-detected).
+          'sensor.elite_200_v2_01_photovoltaics_input_voltage': mk('sensor.elite_200_v2_01_photovoltaics_input_voltage', volt, 'V'),
+          'sensor.elite_200_v2_01_photovoltaics_input_current': mk('sensor.elite_200_v2_01_photovoltaics_input_current', amps, 'A'),
+          // Targets for the button strip.
+          'switch.elite_200_v2_01_ac_outlet': mk('switch.elite_200_v2_01_ac_outlet', 'on', null),
+          'switch.elite_200_v2_01_dc_outlet': mk('switch.elite_200_v2_01_dc_outlet', 'off', null),
+          'switch.elite_200_v2_01_solar_pass': mk('switch.elite_200_v2_01_solar_pass', 'on', null),
         },
         connection: {
           // No template subscriptions in these scenarios — all fields are entity IDs.
           subscribeMessage: () => Promise.resolve(() => {}),
         },
+        callService: (domain, service, data) => {
+          console.log(`[mock hass] ${domain}.${service}`, data);
+          const id = data && data.entity_id;
+          if (service === 'toggle' && id && hass.states[id]) {
+            hass.states[id] = {
+              ...hass.states[id],
+              state: hass.states[id].state === 'on' ? 'off' : 'on',
+            };
+            if (onChange) onChange();
+          }
+          return Promise.resolve();
+        },
       };
+      return hass;
     }
 
     const baseConfig = {
@@ -205,15 +242,81 @@
         // red ring + dimmed readings. Other entities are fresh, so the
         // "Xs ago" text stays normal.
         { id: 'card-unavail',   state: { pv: 0,    grid: 0,    dc: 0,  ac: 347, soc: 'unavailable', runtime: 300, ageSec: 0 } },
+        // options.size: 'compact' shrinks the whole card, and the PV corner
+        // carries two extra readings whose units come from the sensors.
+        {
+          id: 'card-compact',
+          state: { pv: 1100, grid: 0, dc: 0, ac: 250, soc: 65, runtime: 0, volt: 238.4, amps: 4.62 },
+          config: {
+            options: { ...baseConfig.options, size: 'compact' },
+            pv: {
+              ...baseConfig.pv,
+              readings: [
+                // No label -> renders "238.4 V" using the sensor's unit.
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_voltage' },
+                // Label prefixes the value; decimals trim the raw sensor.
+                { entity: 'sensor.elite_200_v2_01_photovoltaics_input_current', label: 'I', decimals: 1 },
+              ],
+            },
+          },
+        },
+        // Three buttons -> one full-height row. Toggle flips the mock switch,
+        // navigate logs the path to the console.
+        {
+          id: 'card-buttons3',
+          state: { pv: 0, grid: 1407, dc: 0, ac: 312, soc: 80, runtime: 60 },
+          config: {
+            buttons: [
+              { name: 'AC outlet', icon: 'mdi:power-plug', entity: 'switch.elite_200_v2_01_ac_outlet', action: 'toggle' },
+              { name: 'DC outlet', icon: 'mdi:current-dc', entity: 'switch.elite_200_v2_01_dc_outlet', action: 'toggle' },
+              { name: 'Energy', icon: 'mdi:transmission-tower', action: 'navigate', navigation_path: '/lovelace/energy' },
+            ],
+          },
+        },
+        // Six buttons -> two rows at half height (same total strip height).
+        {
+          id: 'card-buttons6',
+          state: { pv: 1100, grid: 0, dc: 40, ac: 250, soc: 65, runtime: 0, volt: 236.1, amps: 4.66 },
+          config: {
+            buttons: [
+              { name: 'AC outlet', icon: 'mdi:power-plug', entity: 'switch.elite_200_v2_01_ac_outlet', action: 'toggle' },
+              { name: 'DC outlet', icon: 'mdi:current-dc', entity: 'switch.elite_200_v2_01_dc_outlet', action: 'toggle' },
+              { name: 'Solar', icon: 'mdi:solar-panel', entity: 'switch.elite_200_v2_01_solar_pass', action: 'toggle' },
+              { name: 'BMS', entity: 'sensor.elite_200_v2_01_battery_level' },
+              { name: 'Docs', icon: 'mdi:book-open-page-variant', action: 'url', url: 'https://github.com/sidieje/bluetti-battery-card' },
+              { name: 'Log', icon: 'mdi:bell', action: 'call-service', service: 'notify.persist_notification', service_data: { message: 'from the test harness' }, confirmation: true },
+            ],
+          },
+        },
       ];
       for (const s of scenarios) {
         const host = document.getElementById(s.id);
         const card = document.createElement('integrated-ups-flow-card');
-        card.setConfig({ ...baseConfig });
-        card.hass = makeHass(s.state);
+        let hass;
+        hass = makeHass({
+          ...s.state,
+          // Re-assigning hass re-renders the card after a toggle flipped the
+          // mock entity, mirroring how HA pushes state updates.
+          onChange: () => {
+            card.hass = hass;
+          },
+        });
+        card.setConfig({ ...baseConfig, ...(s.config || {}) });
+        card.hass = hass;
         host.appendChild(card);
       }
     }
+
+    document.addEventListener('hass-navigate', (ev) => {
+      console.log('[mock hass] hass-navigate ->', ev.detail && ev.detail.path);
+    });
+
+    // The six-button scenario has one `confirmation: true` button. Auto-accept
+    // so the harness never blocks on a native dialog.
+    window.confirm = (message) => {
+      console.log('[mock hass] confirm ->', message);
+      return true;
+    };
 
     if (customElements.get('integrated-ups-flow-card')) mountAll();
     else customElements.whenDefined('integrated-ups-flow-card').then(mountAll);

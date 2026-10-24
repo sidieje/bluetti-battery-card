@@ -28,9 +28,18 @@
  * solely by the battery-level entity going `unavailable` (the clean-drop
  * signal), while `stale_threshold` (default 300 s) only controls when the
  * "Xs ago" text turns red (the frozen-value signal).
+ *
+ * v0.6.0 adds sizing controls, an action-button strip, and extra readings.
+ * `options.size` (compact/normal/large) times `options.scale` (0.4–2.2) drives
+ * a single `--ups-scale` custom property that every dimension in the sheet is
+ * derived from, so the measured flow geometry follows along for free.
+ * `buttons:` renders up to three per row under the diagram with per-button
+ * actions (toggle / more-info / call-service / navigate / url), and each
+ * corner takes a `readings:` list — PV voltage and current being the common
+ * ask — whose units default to the sensor's own.
  */
 
-const CARD_VERSION = '0.5.1';
+const CARD_VERSION = '0.6.0';
 const CARD_TAG = 'integrated-ups-flow-card';
 const EDITOR_TAG = `${CARD_TAG}-editor`;
 
@@ -60,7 +69,43 @@ const DEFAULTS = {
   // separately, by the battery-level entity going `unavailable`. BLUETTI's
   // poll cadence sits well under this, so a healthy connection never trips it.
   stale_threshold: 300,
+  size: 'normal',
+  scale: 1,
 };
+
+// Overall card scale. Every dimension in the stylesheet is expressed as
+// `calc(<base> * var(--ups-s))`, so one number resizes the whole card —
+// corners, battery arc, fonts, padding and the flow-area height together.
+// The flow-line geometry is measured from the DOM at render time, so it
+// follows the scale automatically with no extra work.
+const SIZE_PRESETS = {
+  compact: 0.72,
+  normal: 1,
+  large: 1.25,
+};
+const SCALE_MIN = 0.4;
+const SCALE_MAX = 2.2;
+
+// Below this *card* width the stylesheet applies its own shrink factor, so a
+// card in a narrow dashboard column scales down on its own. Kept in sync with
+// the @container breakpoint in STYLES.
+const NARROW_BREAKPOINT = 560;
+const NARROW_FACTOR = 0.82;
+
+// Lovelace masonry row height, used to convert the card's pixel height into
+// the row count returned by getCardSize().
+const LOVELACE_ROW_PX = 50;
+
+// Buttons live in a fixed-height strip under the flow diagram, laid out three
+// per row. One row fills the strip; two rows split it in half (the requested
+// "full size vs half height" behaviour). Three or more rows keep the two-row
+// button height and grow the strip instead, so buttons never get unusably
+// small.
+const BUTTON_COLS = 3;
+const BUTTON_STRIP_PX = 72;
+const BUTTON_MAX_SPLIT_ROWS = 2;
+
+const BUTTON_ACTIONS = ['more-info', 'toggle', 'call-service', 'navigate', 'url', 'none'];
 
 // How often (ms) the relative-age line is refreshed so "Xs ago" keeps ticking
 // even when no new state arrives (a dropped integration stops pushing hass).
@@ -111,6 +156,65 @@ function fmtRuntime(min) {
   const m = total % 60;
   if (h <= 0) return `${m}m`;
   return `${h}h ${m}m`;
+}
+
+// One extra corner reading (voltage, current, temperature, ...). Numeric
+// values are rounded to the configured decimals; anything else is shown
+// verbatim so plain text sensors still work.
+function fmtReading(raw, decimals, unit) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  if (raw === 'unavailable' || raw === 'unknown') return '—';
+  const n = typeof raw === 'number' ? raw : parseFloat(raw);
+  if (!Number.isFinite(n)) return String(raw);
+  const d = Number.isFinite(decimals) ? decimals : 1;
+  const text = String(n.toFixed(d));
+  return unit ? `${text} ${unit}` : text;
+}
+
+// Config -> normalized extra-readings list for one corner.
+function normalizeReadings(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((r) => r && typeof r === 'object' && r.entity)
+    .map((r) => ({
+      entity: String(r.entity),
+      label: r.label ?? r.name ?? null,
+      unit: r.unit !== undefined && r.unit !== null ? String(r.unit) : null,
+      decimals: Number.isFinite(r.decimals) ? clamp(Math.round(r.decimals), 0, 4) : null,
+    }));
+}
+
+// Config -> normalized button list. `action` is inferred when omitted so the
+// common cases stay short: a service means call-service, an entity alone
+// means more-info.
+function normalizeButtons(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((b) => b && typeof b === 'object')
+    .map((b) => {
+      const entity = b.entity ? String(b.entity) : null;
+      let action = b.action ? String(b.action) : null;
+      if (!action) {
+        if (b.service) action = 'call-service';
+        else if (b.navigation_path) action = 'navigate';
+        else if (b.url) action = 'url';
+        else if (entity) action = 'more-info';
+        else action = 'none';
+      }
+      if (!BUTTON_ACTIONS.includes(action)) action = 'none';
+      return {
+        entity,
+        name: b.name !== undefined && b.name !== null ? String(b.name) : null,
+        icon: b.icon ? String(b.icon) : null,
+        action,
+        service: b.service ? String(b.service) : null,
+        service_data: b.service_data || b.data || null,
+        navigation_path: b.navigation_path ? String(b.navigation_path) : null,
+        url: b.url ? String(b.url) : null,
+        color: b.color ? String(b.color) : null,
+        confirmation: !!b.confirmation,
+      };
+    });
 }
 
 // Newest "this entity reported" time, in ms, from a frontend state object.
@@ -199,6 +303,8 @@ class IntegratedUpsFlowCard extends HTMLElement {
         invert_battery_sign: false,
         max_power: 2600,
         stale_threshold: 300,
+        size: 'normal',
+        scale: 1,
       },
     };
   }
@@ -215,6 +321,8 @@ class IntegratedUpsFlowCard extends HTMLElement {
     this._resizeObserver = null;
     this._resizeTimer = null;
     this._freshnessTimer = null;
+    this._buttonEls = [];
+    this._buttonsSig = null;
   }
 
   // ----- Lovelace lifecycle -----
@@ -234,28 +342,22 @@ class IntegratedUpsFlowCard extends HTMLElement {
     const opts = config.options || {};
     const display = config.display || {};
 
+    const corner = (cfg, defName, defIcon) => ({
+      entity: cfg.entity ? String(cfg.entity) : null,
+      name: cfg.name || defName,
+      icon: cfg.icon || defIcon,
+      // Extra sub-readings under the corner's watts (voltage, current, ...).
+      readings: normalizeReadings(cfg.readings),
+    });
+
     this._config = {
       title: config.title ?? null,
-      pv: {
-        entity: pv.entity ? String(pv.entity) : null,
-        name: pv.name || 'PV',
-        icon: pv.icon || 'mdi:solar-panel',
-      },
-      grid: {
-        entity: grid.entity ? String(grid.entity) : null,
-        name: grid.name || 'Grid',
-        icon: grid.icon || 'mdi:transmission-tower',
-      },
-      dc: {
-        entity: dc.entity ? String(dc.entity) : null,
-        name: dc.name || 'DC',
-        icon: dc.icon || 'mdi:current-dc',
-      },
-      ac: {
-        entity: ac.entity ? String(ac.entity) : null,
-        name: ac.name || 'AC',
-        icon: ac.icon || 'mdi:power-plug',
-      },
+      pv: corner(pv, 'PV', 'mdi:solar-panel'),
+      grid: corner(grid, 'Grid', 'mdi:transmission-tower'),
+      dc: corner(dc, 'DC', 'mdi:current-dc'),
+      ac: corner(ac, 'AC', 'mdi:power-plug'),
+      // Action buttons in a strip under the flow diagram, three per row.
+      buttons: normalizeButtons(config.buttons),
       unit: {
         // name / icon are silently preserved for back-compat with v0.2/v0.3
         // configs but no longer rendered anywhere.
@@ -302,6 +404,9 @@ class IntegratedUpsFlowCard extends HTMLElement {
           Number.isFinite(opts.stale_threshold) && opts.stale_threshold > 0
             ? opts.stale_threshold
             : DEFAULTS.stale_threshold,
+        // Preset size, then an optional fine-tune multiplier on top of it.
+        size: SIZE_PRESETS[opts.size] ? String(opts.size) : DEFAULTS.size,
+        scale: clamp(toNum(opts.scale, DEFAULTS.scale), SCALE_MIN, SCALE_MAX),
       },
     };
 
@@ -346,11 +451,71 @@ class IntegratedUpsFlowCard extends HTMLElement {
     this._resetTemplateSubs();
   }
 
+  // Lovelace reserves this many rows in the masonry grid. v0.5 returned a
+  // fixed 5 no matter how big the card actually was; now it tracks the
+  // configured size/scale and the button strip, so a compact card stops
+  // hogging half a dashboard.
   getCardSize() {
-    return 5;
+    if (!this._config) return 5;
+    // Once the card is on screen, measure it — that includes the narrow-column
+    // factor and any wrapping the browser did. The estimate below only covers
+    // the first layout pass and the editor preview.
+    const measured = this.offsetHeight;
+    if (measured > 0) return Math.max(2, Math.ceil(measured / LOVELACE_ROW_PX));
+    const s = this._effectiveScale();
+    let h = (320 + 32) * s;
+    if (this._config.title) h += 34 * s + 12;
+    h += this._buttonStripHeight(s);
+    return Math.max(2, Math.round(h / LOVELACE_ROW_PX));
+  }
+
+  // ----- Size / scale -----
+
+  // Effective scale = preset multiplier × the user's fine-tune. The stylesheet
+  // multiplies this by --ups-narrow on narrow viewports.
+  _effectiveScale() {
+    if (!this._config) return 1;
+    const preset = SIZE_PRESETS[this._config.options.size] ?? 1;
+    const user = this._config.options.scale;
+    return clamp(preset * (Number.isFinite(user) ? user : 1), SCALE_MIN, SCALE_MAX);
+  }
+
+  // Height of a single button row. One row fills the strip; two rows split it
+  // in half (gaps included, so the strip stays the same height either way);
+  // three or more keep the two-row height and grow the strip so buttons stay
+  // tappable.
+  _buttonRowHeight(scale) {
+    const n = this._config ? this._config.buttons.length : 0;
+    if (n === 0) return 0;
+    const rows = Math.min(Math.ceil(n / BUTTON_COLS), BUTTON_MAX_SPLIT_ROWS);
+    const gap = 8 * scale;
+    return (BUTTON_STRIP_PX * scale - gap * (rows - 1)) / rows;
+  }
+
+  // Total vertical space the strip takes: rows + inner gaps + the top margin.
+  _buttonStripHeight(scale) {
+    const n = this._config ? this._config.buttons.length : 0;
+    if (n === 0) return 0;
+    const rows = Math.ceil(n / BUTTON_COLS);
+    const gap = 8 * scale;
+    return this._buttonRowHeight(scale) * rows + gap * rows;
   }
 
   // ----- Template subscriptions (real HA WS API) -----
+
+  // Entity IDs behind every configured corner reading. They participate in
+  // template subscriptions and in the staleness calculation just like the
+  // power sensors, since they come from the same device.
+  _readingEntities() {
+    if (!this._config) return [];
+    const out = [];
+    for (const key of ['pv', 'grid', 'dc', 'ac']) {
+      const cfg = this._config[key];
+      if (!cfg || !Array.isArray(cfg.readings)) continue;
+      for (const r of cfg.readings) if (r.entity) out.push(r.entity);
+    }
+    return out;
+  }
 
   _templateFields() {
     if (!this._config) return [];
@@ -360,6 +525,7 @@ class IntegratedUpsFlowCard extends HTMLElement {
       c.grid.entity,
       c.dc.entity,
       c.ac.entity,
+      ...this._readingEntities(),
       c.unit.soc_entity,
       c.unit.power_entity,
       c.display.runtime_entity,
@@ -497,6 +663,13 @@ class IntegratedUpsFlowCard extends HTMLElement {
     // Center battery info (overlaid on the SoC arc, which lives in SVG).
     this._battery = this._createBatteryCenter();
     grid.appendChild(this._battery.root);
+
+    // Action-button strip under the diagram. Filled in by _syncButtons().
+    const buttons = document.createElement('div');
+    buttons.className = 'ups-buttons';
+    buttons.style.display = 'none';
+    card.appendChild(buttons);
+    this._buttons = buttons;
   }
 
   _createCornerNode(key, position) {
@@ -515,8 +688,12 @@ class IntegratedUpsFlowCard extends HTMLElement {
     power.className = 'corner__power';
     const name = document.createElement('div');
     name.className = 'corner__name';
+    // Row of extra readings (voltage / current / ...) under the name.
+    const readings = document.createElement('div');
+    readings.className = 'corner__readings';
     meta.appendChild(power);
     meta.appendChild(name);
+    meta.appendChild(readings);
 
     if (position === 'tl' || position === 'bl') {
       root.appendChild(iconWrap);
@@ -528,7 +705,7 @@ class IntegratedUpsFlowCard extends HTMLElement {
 
     root.addEventListener('click', (e) => this._handleCornerClick(key, e));
 
-    return { root, icon, name, power, iconWrap };
+    return { root, icon, name, power, iconWrap, readings, readingEls: [] };
   }
 
   // Fire `hass-more-info` so the lovelace shell opens its standard dialog.
@@ -665,6 +842,9 @@ class IntegratedUpsFlowCard extends HTMLElement {
     const c = this._config;
     const opt = c.options;
 
+    // Single knob the stylesheet multiplies every base dimension by.
+    this.style.setProperty('--ups-scale', String(this._effectiveScale()));
+
     if (c.title) {
       this._header.textContent = c.title;
       this._header.style.display = '';
@@ -782,6 +962,9 @@ class IntegratedUpsFlowCard extends HTMLElement {
     this._setFlowState('dc', dcP > opt.idle_threshold, dcP, opt.max_power);
     this._setFlowState('ac', acP > opt.idle_threshold, acP, opt.max_power);
 
+    // ---- Action button strip ----
+    this._syncButtons();
+
     // Recompute path geometry — node positions can shift on resize.
     this._updatePaths();
 
@@ -806,18 +989,61 @@ class IntegratedUpsFlowCard extends HTMLElement {
     if (!present) {
       node.root.style.display = 'none';
       node.root.classList.remove('is-active', 'is-clickable');
+      node.readings.style.display = 'none';
       return;
     }
     node.root.style.display = '';
     node.icon.setAttribute('icon', cfg.icon);
     node.name.textContent = cfg.name;
     node.power.textContent = fmtPower(power);
+    this._updateReadings(node, cfg);
     const active = power > idle;
     node.root.classList.toggle('is-active', active);
     // Clickable only when the entity is a plain entity_id (templates have no
     // single entity to open a more-info dialog for).
     const clickable = !!cfg.entity && !isTemplate(cfg.entity);
     node.root.classList.toggle('is-clickable', clickable);
+  }
+
+  // Extra sub-readings under a corner. The row is rebuilt only when the
+  // configured count changes; the values themselves refresh every render.
+  _updateReadings(node, cfg) {
+    const readings = (cfg && cfg.readings) || [];
+    if (readings.length === 0) {
+      node.readings.style.display = 'none';
+      return;
+    }
+    node.readings.style.display = '';
+
+    if (node.readingEls.length !== readings.length) {
+      node.readings.innerHTML = '';
+      node.readingEls = readings.map((r) => {
+        const el = document.createElement('div');
+        el.className = 'corner__reading';
+        if (r.entity && !isTemplate(r.entity)) {
+          el.classList.add('is-clickable');
+          el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._fireMoreInfo(r.entity);
+          });
+        }
+        node.readings.appendChild(el);
+        return el;
+      });
+    }
+
+    readings.forEach((r, i) => {
+      const el = node.readingEls[i];
+      // An omitted `unit:` falls back to whatever the sensor reports.
+      let unit = r.unit;
+      if (unit === null && !isTemplate(r.entity) && this._hass && this._hass.states) {
+        const s = this._hass.states[r.entity];
+        const uom = s && s.attributes && s.attributes.unit_of_measurement;
+        if (uom) unit = String(uom);
+      }
+      const value = fmtReading(this._getRaw(r.entity), r.decimals, unit) || '—';
+      el.textContent = r.label ? `${r.label} ${value}` : value;
+    });
   }
 
   _setFlowState(key, active, power, maxPower) {
@@ -860,6 +1086,7 @@ class IntegratedUpsFlowCard extends HTMLElement {
       c.grid.entity,
       c.dc.entity,
       c.ac.entity,
+      ...this._readingEntities(),
       c.unit.soc_entity,
       c.unit.power_entity,
       c.display.runtime_entity,
@@ -940,6 +1167,187 @@ class IntegratedUpsFlowCard extends HTMLElement {
     if (this._freshnessTimer) {
       clearInterval(this._freshnessTimer);
       this._freshnessTimer = null;
+    }
+  }
+
+  // ----- Action buttons -----
+
+  // Rebuilds the strip only when the button config changes; row height,
+  // on/off state and accent color refresh on every render.
+  _syncButtons() {
+    if (!this._buttons || !this._config) return;
+    const buttons = this._config.buttons;
+
+    if (buttons.length === 0) {
+      this._buttons.style.display = 'none';
+      this._buttons.innerHTML = '';
+      this._buttonEls = [];
+      this._buttonsSig = null;
+      return;
+    }
+    this._buttons.style.display = '';
+
+    const sig = JSON.stringify(buttons);
+    if (sig !== this._buttonsSig) {
+      this._buttonsSig = sig;
+      this._buildButtons(buttons);
+    }
+
+    const scale = this._effectiveScale();
+    const rowH = this._buttonRowHeight(scale);
+    // Letting the grid stack the rows (rather than fixing the strip height)
+    // keeps the CSS gap — which also scales with --ups-narrow — accounted for.
+    this._buttons.style.gridAutoRows = `${rowH}px`;
+    // Two rows of three halves each button, so drop to a tighter look.
+    this._buttons.classList.toggle('is-compact', rowH < 44 * scale + 0.5);
+
+    buttons.forEach((b, i) => {
+      const el = this._buttonEls[i];
+      if (!el) return;
+      el.classList.toggle('is-on', this._buttonIsOn(b));
+      if (b.color) el.style.setProperty('--ups-btn-accent', b.color);
+      else el.style.removeProperty('--ups-btn-accent');
+    });
+  }
+
+  _buildButtons(buttons) {
+    this._buttons.innerHTML = '';
+    this._buttonEls = buttons.map((b) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ups-btn';
+
+      const iconEl = document.createElement('ha-icon');
+      iconEl.className = 'ups-btn__icon';
+      iconEl.setAttribute('icon', b.icon || this._defaultButtonIcon(b));
+
+      const label = document.createElement('span');
+      label.className = 'ups-btn__label';
+      label.textContent = b.name || this._defaultButtonLabel(b);
+
+      btn.appendChild(iconEl);
+      btn.appendChild(label);
+      btn.addEventListener('click', (e) => this._handleButtonAction(b, e));
+      this._buttons.appendChild(btn);
+      return btn;
+    });
+  }
+
+  _entityDomain(entityId) {
+    if (!entityId || !entityId.includes('.')) return null;
+    return entityId.split('.')[0];
+  }
+
+  _defaultButtonIcon(b) {
+    const domain = this._entityDomain(b.entity);
+    if (b.entity && domain && (b.action === 'more-info' || b.action === 'toggle')) {
+      const s = this._hass && this._hass.states && this._hass.states[b.entity];
+      if (s && s.attributes && s.attributes.icon && !isTemplate(b.entity)) {
+        return s.attributes.icon;
+      }
+      const byDomain = {
+        switch: 'mdi:toggle-switch',
+        input_boolean: 'mdi:toggle-switch',
+        light: 'mdi:lightbulb',
+        fan: 'mdi:fan',
+        lock: 'mdi:lock',
+        cover: 'mdi:window-shutter',
+      };
+      if (byDomain[domain]) return byDomain[domain];
+    }
+    if (b.action === 'navigate') return 'mdi:arrow-right-circle-outline';
+    if (b.action === 'url') return 'mdi:open-in-new';
+    if (b.action === 'call-service') return 'mdi:cog-outline';
+    return 'mdi:gesture-tap-button';
+  }
+
+  // Fall back to a humanized entity object id, then to the action name.
+  _defaultButtonLabel(b) {
+    if (b.entity && !isTemplate(b.entity)) {
+      const tail = b.entity.split('.').slice(1).join('.');
+      if (tail) {
+        return tail.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+      }
+    }
+    return b.action;
+  }
+
+  _buttonIsOn(b) {
+    if (!b.entity || !this._hass || !this._hass.states) return false;
+    if (b.action !== 'toggle' && b.action !== 'more-info') return false;
+    const s = this._hass.states[b.entity];
+    return !!s && s.state === 'on';
+  }
+
+  async _handleButtonAction(button, event) {
+    if (event) event.stopPropagation();
+    if (button.action === 'none') return;
+    if (button.confirmation) {
+      const text = button.confirmation_text || `Run ${button.name || button.service || button.action}?`;
+      if (!window.confirm(text)) return;
+    }
+
+    const hass = this._hass;
+    switch (button.action) {
+      case 'more-info':
+        this._fireMoreInfo(button.entity);
+        break;
+
+      case 'toggle': {
+        if (!button.entity) return;
+        const domain = this._entityDomain(button.entity);
+        if (!domain || !hass || typeof hass.callService !== 'function') {
+          console.error(`${CARD_TAG}: cannot toggle ${button.entity} — no callService available`);
+          return;
+        }
+        try {
+          await hass.callService(domain, 'toggle', { entity_id: button.entity });
+        } catch (err) {
+          console.error(`${CARD_TAG}: toggle failed for ${button.entity}`, err);
+        }
+        break;
+      }
+
+      case 'call-service': {
+        if (!button.service) return;
+        const dot = button.service.indexOf('.');
+        if (dot <= 0 || dot === button.service.length - 1) {
+          console.error(`${CARD_TAG}: invalid service "${button.service}" — expected domain.service`);
+          return;
+        }
+        if (!hass || typeof hass.callService !== 'function') {
+          console.error(`${CARD_TAG}: cannot call ${button.service} — no callService available`);
+          return;
+        }
+        const data = button.service_data ? { ...button.service_data } : {};
+        // `service: switch.turn_on` + `entity:` is enough on its own.
+        if (!data.entity_id && button.entity) data.entity_id = button.entity;
+        try {
+          await hass.callService(
+            button.service.slice(0, dot),
+            button.service.slice(dot + 1),
+            Object.keys(data).length ? data : undefined
+          );
+        } catch (err) {
+          console.error(`${CARD_TAG}: service call ${button.service} failed`, err);
+        }
+        break;
+      }
+
+      case 'navigate': {
+        if (!button.navigation_path) return;
+        const evt = new Event('hass-navigate', { bubbles: true, composed: true });
+        evt.detail = { path: button.navigation_path };
+        this.dispatchEvent(evt);
+        break;
+      }
+
+      case 'url':
+        if (button.url) window.open(button.url, '_blank', 'noopener');
+        break;
+
+      default:
+        break;
     }
   }
 
@@ -1039,22 +1447,31 @@ class IntegratedUpsFlowCard extends HTMLElement {
 const STYLES = `
 :host {
   display: block;
+  /* --ups-scale is set inline from options.size × options.scale. Every
+     dimension below is calc(<base> * var(--ups-s)), so one number resizes
+     the whole card. The narrow-column rules at the bottom of the sheet
+     re-derive --ups-s with an extra factor. */
+  --ups-scale: 1;
+  --ups-s: calc(var(--ups-scale) * 1);
+  /* Makes the card its own query container so the narrow shrink follows the
+     column the card sits in, not the browser window. */
+  container-type: inline-size;
 }
 .ups-card {
-  padding: 16px;
+  padding: calc(16px * var(--ups-s));
   box-sizing: border-box;
 }
 .ups-header {
-  font-size: 1.1rem;
+  font-size: calc(1.1rem * var(--ups-s));
   font-weight: 500;
   color: var(--primary-text-color, #212121);
-  margin-bottom: 12px;
+  margin-bottom: calc(12px * var(--ups-s));
   padding: 0 4px;
 }
 .ups-wrap {
   position: relative;
   width: 100%;
-  min-height: 320px;
+  min-height: calc(320px * var(--ups-s));
 }
 .ups-svg {
   position: absolute;
@@ -1070,14 +1487,14 @@ const STYLES = `
 .flow-base {
   fill: none;
   stroke: var(--divider-color, rgba(127, 127, 127, 0.35));
-  stroke-width: 3;
+  stroke-width: calc(3px * var(--ups-s));
   stroke-linecap: round;
   stroke-linejoin: round;
   transition: stroke 0.3s ease, opacity 0.3s ease;
 }
 .flow-overlay {
   fill: none;
-  stroke-width: 3.5;
+  stroke-width: calc(3.5px * var(--ups-s));
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 18 220;
@@ -1107,8 +1524,8 @@ const STYLES = `
   align-items: center;
   z-index: 1;
   width: 100%;
-  min-height: 320px;
-  gap: 8px;
+  min-height: calc(320px * var(--ups-s));
+  gap: calc(8px * var(--ups-s));
 }
 .corner--tl { grid-area: pv; justify-self: start; }
 .corner--tr { grid-area: grid; justify-self: end; }
@@ -1141,7 +1558,7 @@ const STYLES = `
 .corner {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: calc(10px * var(--ups-s));
   min-width: 0;
   max-width: 100%;
 }
@@ -1150,8 +1567,8 @@ const STYLES = `
   box-shadow: 0 0 0 2px var(--divider-color, rgba(127, 127, 127, 0.4));
 }
 .corner__icon-wrap {
-  width: 44px;
-  height: 44px;
+  width: calc(44px * var(--ups-s));
+  height: calc(44px * var(--ups-s));
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -1161,7 +1578,7 @@ const STYLES = `
   transition: background 0.3s ease, color 0.3s ease, box-shadow 0.3s ease;
 }
 .corner__icon {
-  --mdc-icon-size: 24px;
+  --mdc-icon-size: calc(24px * var(--ups-s));
   color: var(--secondary-text-color, #aaa);
   transition: color 0.3s ease;
 }
@@ -1175,18 +1592,37 @@ const STYLES = `
 .corner--tl .corner__meta,
 .corner--bl .corner__meta { align-items: flex-start; text-align: left; }
 .corner__power {
-  font-size: 1.15rem;
+  font-size: calc(1.15rem * var(--ups-s));
   font-weight: 700;
   color: var(--primary-text-color, #fff);
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 .corner__name {
-  font-size: 0.78rem;
+  font-size: calc(0.78rem * var(--ups-s));
   color: var(--secondary-text-color, #999);
   letter-spacing: 0.02em;
   margin-top: 1px;
 }
+
+/* Extra per-corner readings (voltage, current, temperature, ...). Shown as a
+   compact row under the corner name; each one is clickable when it maps to a
+   real entity. */
+.corner__readings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(3px * var(--ups-s)) calc(8px * var(--ups-s));
+  margin-top: calc(3px * var(--ups-s));
+  font-variant-numeric: tabular-nums;
+}
+.corner__reading {
+  font-size: calc(0.72rem * var(--ups-s));
+  color: var(--secondary-text-color, #999);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.corner__reading.is-clickable { cursor: pointer; }
+.corner__reading.is-clickable:hover { color: var(--primary-text-color, #fff); }
 .corner.is-absent .corner__power { color: var(--secondary-text-color, #999); }
 
 /* Active highlighting matches the flow color for each direction. */
@@ -1199,8 +1635,8 @@ const STYLES = `
 /* Battery center ---------------------------------------------------- */
 .battery-center {
   position: relative;
-  width: 200px;
-  height: 200px;
+  width: calc(200px * var(--ups-s));
+  height: calc(200px * var(--ups-s));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1240,10 +1676,10 @@ const STYLES = `
   width: 70%;
 }
 .battery-icon-wrap {
-  margin-bottom: 4px;
+  margin-bottom: calc(4px * var(--ups-s));
 }
 .battery-icon {
-  --mdc-icon-size: 26px;
+  --mdc-icon-size: calc(26px * var(--ups-s));
   color: var(--success-color, #4caf50);
   transition: color 0.3s ease;
 }
@@ -1252,57 +1688,57 @@ const STYLES = `
 .battery-center.soc-unknown .battery-icon { color: var(--secondary-text-color, #999); }
 
 .battery-soc {
-  font-size: 2.6rem;
+  font-size: calc(2.6rem * var(--ups-s));
   font-weight: 700;
   color: var(--primary-text-color, #fff);
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
 .battery-soc-unit {
-  font-size: 1rem;
+  font-size: calc(1rem * var(--ups-s));
   margin-left: 2px;
   color: var(--secondary-text-color, #999);
   font-weight: 500;
 }
 .battery-state {
-  font-size: 0.8rem;
+  font-size: calc(0.8rem * var(--ups-s));
   color: var(--secondary-text-color, #999);
   text-transform: capitalize;
-  margin-top: 4px;
+  margin-top: calc(4px * var(--ups-s));
   letter-spacing: 0.03em;
 }
 .battery-center.state-charge .battery-state    { color: var(--success-color, #4caf50); }
 .battery-center.state-discharge .battery-state { color: var(--warning-color, #ff9800); }
 .battery-throughput {
-  font-size: 0.85rem;
+  font-size: calc(0.85rem * var(--ups-s));
   font-weight: 600;
   color: var(--secondary-text-color, #999);
-  margin-top: 2px;
+  margin-top: calc(2px * var(--ups-s));
   font-variant-numeric: tabular-nums;
   min-height: 1.1em;
 }
 .battery-center.state-charge .battery-throughput    { color: var(--success-color, #4caf50); }
 .battery-center.state-discharge .battery-throughput { color: var(--warning-color, #ff9800); }
 .battery-runtime {
-  font-size: 0.78rem;
+  font-size: calc(0.78rem * var(--ups-s));
   color: var(--secondary-text-color, #999);
-  margin-top: 2px;
+  margin-top: calc(2px * var(--ups-s));
   font-variant-numeric: tabular-nums;
   min-height: 1em;
 }
 .battery-freshness {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  font-size: 0.72rem;
+  gap: calc(3px * var(--ups-s));
+  font-size: calc(0.72rem * var(--ups-s));
   color: var(--secondary-text-color, #999);
-  margin-top: 4px;
+  margin-top: calc(4px * var(--ups-s));
   font-variant-numeric: tabular-nums;
   min-height: 1em;
   transition: color 0.3s ease;
 }
 .battery-freshness__icon {
-  --mdc-icon-size: 13px;
+  --mdc-icon-size: calc(13px * var(--ups-s));
   color: inherit;
 }
 .battery-freshness.is-stale {
@@ -1325,19 +1761,83 @@ const STYLES = `
   transition: opacity 0.3s ease;
 }
 
-/* Responsive --------------------------------------------------------- */
-@media (max-width: 560px) {
-  .ups-card { padding: 12px; }
-  .ups-wrap { min-height: 280px; }
-  .ups-grid { min-height: 280px; gap: 4px; grid-template-columns: 1fr 1.4fr 1fr; }
-  .corner__icon-wrap { width: 36px; height: 36px; }
-  .corner__icon { --mdc-icon-size: 20px; }
-  .corner__power { font-size: 1rem; }
-  .corner__name { font-size: 0.72rem; }
-  .battery-center { width: 160px; height: 160px; }
-  .battery-icon { --mdc-icon-size: 22px; }
-  .battery-soc { font-size: 2.1rem; }
-  .battery-soc-unit { font-size: 0.85rem; }
+/* Action buttons ------------------------------------------------------
+   Three per row, in a strip of fixed total height: a single row of buttons
+   fills the strip, two rows split it in half. The strip height and the
+   compact flag are set inline from _syncButtons(). */
+.ups-buttons {
+  display: grid;
+  grid-template-columns: repeat(${BUTTON_COLS}, 1fr);
+  grid-auto-rows: 1fr;
+  gap: calc(8px * var(--ups-s));
+  margin-top: calc(8px * var(--ups-s));
+}
+.ups-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(6px * var(--ups-s));
+  min-width: 0;
+  margin: 0;
+  padding: 0 calc(8px * var(--ups-s));
+  border: none;
+  border-radius: calc(8px * var(--ups-s));
+  background: var(--secondary-background-color, rgba(127, 127, 127, 0.14));
+  color: var(--primary-text-color, #fff);
+  font-family: inherit;
+  font-size: calc(0.82rem * var(--ups-s));
+  font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+.ups-btn:hover { background: rgba(127, 127, 127, 0.26); }
+.ups-btn:active { transform: translateY(1px); }
+.ups-btn__icon {
+  --mdc-icon-size: calc(20px * var(--ups-s));
+  flex-shrink: 0;
+  color: var(--secondary-text-color, #999);
+  transition: color 0.2s ease;
+}
+.ups-btn__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Toggle / more-info buttons bound to an entity light up while it is on. */
+.ups-btn.is-on {
+  box-shadow: inset 0 0 0 2px var(--ups-btn-accent, var(--primary-color, #03a9f4));
+}
+.ups-btn.is-on .ups-btn__icon {
+  color: var(--ups-btn-accent, var(--primary-color, #03a9f4));
+}
+/* Half-height buttons (two rows of three) get tighter type. */
+.ups-buttons.is-compact .ups-btn { font-size: calc(0.72rem * var(--ups-s)); }
+.ups-buttons.is-compact .ups-btn__icon { --mdc-icon-size: calc(16px * var(--ups-s)); }
+
+/* Responsive ---------------------------------------------------------
+   A narrow *column* shrinks the whole card through the same --ups-s knob
+   instead of overriding each dimension by hand. The host is the query
+   container (see :host above), so the container query keys on the card's own
+   width rather than the window's. The viewport-based rule is only useful where
+   container queries are unsupported, so it is gated behind @supports to keep it
+   from shrinking wide cards in a small window. */
+@supports not (container-type: inline-size) {
+  @media (max-width: ${NARROW_BREAKPOINT}px) {
+    :host {
+      --ups-s: calc(var(--ups-scale) * ${NARROW_FACTOR});
+    }
+    .ups-grid { grid-template-columns: 1fr 1.4fr 1fr; }
+  }
+}
+@container (max-width: ${NARROW_BREAKPOINT}px) {
+  .ups-card {
+    --ups-s: calc(var(--ups-scale) * ${NARROW_FACTOR});
+  }
+  .ups-grid { grid-template-columns: 1fr 1.4fr 1fr; }
 }
 `;
 
@@ -1354,7 +1854,16 @@ customElements.define(CARD_TAG, IntegratedUpsFlowCard);
  * ========================================================================= */
 
 const ENTITY_SELECTOR = { entity: { filter: { domain: 'sensor' } } };
+const CONTROL_ENTITY_SELECTOR = { entity: {} };
 const TEMPLATE_SELECTOR = { template: {} };
+
+// ha-form has no repeatable list, so the editor exposes fixed slots instead:
+// `<corner>.reading1_*` / `.reading2_*` for extra readings and top-level
+// `button1`..`button6` for the button strip. configToFormSlots /
+// formSlotsToConfig translate between those slots and the YAML arrays.
+const CORNER_KEYS = ['pv', 'grid', 'dc', 'ac'];
+const MAX_EDITOR_READINGS = 2;
+const MAX_EDITOR_BUTTONS = 6;
 
 // Top-level field labels (shown on the form input)
 const EDITOR_LABELS = {
@@ -1384,6 +1893,15 @@ const EDITOR_LABELS = {
   max_power: 'Max power for animation scaling (W)',
   stale_threshold: 'Stale threshold (seconds)',
   invert_battery_sign: 'Invert sign of battery power sensor',
+  size: 'Card size',
+  scale: 'Fine-tune scale (multiplier)',
+  action: 'Action on tap',
+  service: 'Service (domain.service)',
+  service_data: 'Service data',
+  navigation_path: 'Navigation path',
+  url: 'URL to open',
+  color: 'Accent color',
+  confirmation: 'Ask for confirmation first',
 };
 
 // Per-field helper text rendered under the input.
@@ -1413,11 +1931,165 @@ const EDITOR_HELPERS = {
     'When the newest reading is older than this many seconds, the "Xs ago" text turns red. Text color only — the card\'s red border is separate, and appears when the battery-level entity goes unavailable. Default 300 s.',
   invert_battery_sign:
     "Only relevant when 'Battery power sensor' above is set. Toggle on if that sensor reports discharge as positive (some integrations).",
+  size:
+    'Scales the whole card — corners, battery arc, fonts and height together. Compact is about 70% of normal and reserves fewer dashboard rows.',
+  scale:
+    'Optional multiplier on top of the preset above. 0.8 is 20% smaller than the preset; 1 leaves it alone.',
+  action:
+    'more-info opens the entity dialog, toggle switches it on/off, call-service runs the service below, navigate jumps to a dashboard path, url opens a link.',
+  service:
+    'Service to call, written as domain.service (e.g. switch.turn_on). Leave entity above set and it is passed automatically.',
+  service_data:
+    'Extra service data as key/value pairs. The entity_id is filled in from the entity field unless you set it here.',
+  navigation_path:
+    'Dashboard path to jump to, e.g. /lovelace/energy or /config/devices.',
+  url: 'Full https:// link to open in a new tab.',
+  color:
+    'Accent color for this button (hex or CSS color). Used for the icon and the "on" outline.',
+  confirmation:
+    'Shows a confirm prompt before running the action. Worth enabling for anything that turns the unit off.',
 };
+
+// Labels/helpers for the per-corner reading slots — generated because the same
+// slot names are reused inside every corner section.
+for (let i = 1; i <= MAX_EDITOR_READINGS; i++) {
+  EDITOR_LABELS[`reading${i}_entity`] = `Reading ${i} — sensor`;
+  EDITOR_LABELS[`reading${i}_label`] = `Reading ${i} — prefix label`;
+  EDITOR_LABELS[`reading${i}_unit`] = `Reading ${i} — unit`;
+  EDITOR_LABELS[`reading${i}_decimals`] = `Reading ${i} — decimal places`;
+  EDITOR_HELPERS[`reading${i}_entity`] =
+    "Shown as a small line under the corner name. Clicking it opens this sensor's more-info dialog.";
+  EDITOR_HELPERS[`reading${i}_label`] =
+    'Optional text in front of the value, e.g. "PV" so it reads "PV 231.4 V". Leave empty to show just the number.';
+  EDITOR_HELPERS[`reading${i}_unit`] =
+    'Leave empty to use whatever unit the sensor itself reports.';
+  EDITOR_HELPERS[`reading${i}_decimals`] =
+    'Leave empty to default to 1 decimal place.';
+}
 
 // Build the form schema dynamically so override fields only appear when their
 // corresponding toggle is on, and `invert_battery_sign` is only offered when
 // a `power_entity` is configured.
+// YAML stores extra readings and buttons as arrays; ha-form can't render a
+// repeatable list, so the editor works with fixed slots. These two helpers
+// convert in each direction and are kept idempotent so either form can be fed
+// back into the other.
+function configToFormSlots(config) {
+  const c = { ...(config || {}) };
+
+  for (const key of CORNER_KEYS) {
+    if (!c[key] || typeof c[key] !== 'object') continue;
+    const corner = { ...c[key] };
+    const readings = Array.isArray(corner.readings) ? corner.readings : [];
+    for (let i = 0; i < MAX_EDITOR_READINGS; i++) {
+      const r = readings[i] || {};
+      corner[`reading${i + 1}_entity`] = r.entity ?? '';
+      corner[`reading${i + 1}_label`] = r.label ?? '';
+      corner[`reading${i + 1}_unit`] = r.unit ?? '';
+      corner[`reading${i + 1}_decimals`] = Number.isFinite(r.decimals) ? r.decimals : undefined;
+    }
+    delete corner.readings;
+    c[key] = corner;
+  }
+
+  const buttons = Array.isArray(c.buttons) ? c.buttons : [];
+  for (let i = 0; i < MAX_EDITOR_BUTTONS; i++) {
+    c[`button${i + 1}`] = { ...(buttons[i] || {}) };
+  }
+  delete c.buttons;
+
+  return c;
+}
+
+function formSlotsToConfig(config) {
+  const c = { ...(config || {}) };
+
+  for (const key of CORNER_KEYS) {
+    if (!c[key] || typeof c[key] !== 'object') continue;
+    const corner = { ...c[key] };
+    const readings = [];
+    for (let i = 1; i <= MAX_EDITOR_READINGS; i++) {
+      const entity = corner[`reading${i}_entity`];
+      const label = corner[`reading${i}_label`];
+      const unit = corner[`reading${i}_unit`];
+      const decimals = corner[`reading${i}_decimals`];
+      delete corner[`reading${i}_entity`];
+      delete corner[`reading${i}_label`];
+      delete corner[`reading${i}_unit`];
+      delete corner[`reading${i}_decimals`];
+      if (!entity) continue;
+      const r = { entity };
+      if (label) r.label = label;
+      if (unit) r.unit = unit;
+      if (Number.isFinite(decimals)) r.decimals = decimals;
+      readings.push(r);
+    }
+    if (readings.length) corner.readings = readings;
+    else delete corner.readings;
+    c[key] = corner;
+  }
+
+  const buttons = [];
+  for (let i = 1; i <= MAX_EDITOR_BUTTONS; i++) {
+    const slot = c[`button${i}`];
+    delete c[`button${i}`];
+    if (!slot || typeof slot !== 'object') continue;
+    const b = {};
+    for (const [k, v] of Object.entries(slot)) {
+      if (v === undefined || v === null || v === '' || v === false) continue;
+      b[k] = v;
+    }
+    if (Object.keys(b).length === 0) continue;
+    buttons.push(b);
+  }
+  if (buttons.length) c.buttons = buttons;
+  else delete c.buttons;
+
+  return c;
+}
+
+// One button slot. The fields shown depend on the chosen action, so a
+// call-service button isn't offered a navigation path and vice versa.
+function buttonSection(n, b) {
+  const action =
+    b.action ||
+    (b.service
+      ? 'call-service'
+      : b.navigation_path
+        ? 'navigate'
+        : b.url
+          ? 'url'
+          : b.entity
+            ? 'more-info'
+            : 'toggle');
+
+  const schema = [
+    { name: 'name', selector: { text: {} } },
+    { name: 'icon', selector: { icon: {} } },
+    { name: 'entity', selector: CONTROL_ENTITY_SELECTOR },
+    {
+      name: 'action',
+      selector: {
+        select: { mode: 'dropdown', options: BUTTON_ACTIONS.filter((a) => a !== 'none') },
+      },
+    },
+  ];
+  if (action === 'call-service') {
+    schema.push({ name: 'service', selector: { text: {} } });
+    schema.push({ name: 'service_data', selector: { object: {} } });
+  }
+  if (action === 'navigate') {
+    schema.push({ name: 'navigation_path', selector: { text: {} } });
+  }
+  if (action === 'url') {
+    schema.push({ name: 'url', selector: { text: {} } });
+  }
+  schema.push({ name: 'color', selector: { text: {} } });
+  schema.push({ name: 'confirmation', selector: { boolean: {} } });
+
+  return { name: `button${n}`, type: 'expandable', title: `Button ${n}`, schema };
+}
+
 function buildEditorSchema(config) {
   const c = config || {};
   const u = c.unit || {};
@@ -1442,6 +2114,14 @@ function buildEditorSchema(config) {
 
   const optionsSchema = [
     {
+      name: 'size',
+      selector: { select: { mode: 'dropdown', options: ['compact', 'normal', 'large'] } },
+    },
+    {
+      name: 'scale',
+      selector: { number: { min: 0.4, max: 2.2, step: 0.05, mode: 'slider' } },
+    },
+    {
       name: 'idle_threshold',
       selector: {
         number: { min: 0, max: 200, step: 1, mode: 'box', unit_of_measurement: 'W' },
@@ -1464,48 +2144,48 @@ function buildEditorSchema(config) {
     optionsSchema.push({ name: 'invert_battery_sign', selector: { boolean: {} } });
   }
 
+  // Corner sections carry the entity/name/icon fields plus the extra-reading
+  // slots. A slot only appears once the previous one names a sensor.
+  const cornerSections = [
+    ['pv', 'PV input (top-left)'],
+    ['grid', 'Grid input (top-right)'],
+    ['dc', 'DC output (bottom-left)'],
+    ['ac', 'AC output (bottom-right)'],
+  ].map(([key, title]) => {
+    const corner = c[key] || {};
+    const schema = [
+      { name: 'entity', selector: ENTITY_SELECTOR },
+      { name: 'name', selector: { text: {} } },
+      { name: 'icon', selector: { icon: {} } },
+    ];
+    for (let i = 1; i <= MAX_EDITOR_READINGS; i++) {
+      if (i > 1 && !corner[`reading${i - 1}_entity`]) break;
+      schema.push({ name: `reading${i}_entity`, selector: ENTITY_SELECTOR });
+      if (!corner[`reading${i}_entity`]) continue;
+      schema.push({ name: `reading${i}_label`, selector: { text: {} } });
+      schema.push({ name: `reading${i}_unit`, selector: { text: {} } });
+      schema.push({
+        name: `reading${i}_decimals`,
+        selector: { number: { min: 0, max: 4, step: 1, mode: 'box' } },
+      });
+    }
+    return { name: key, type: 'expandable', title, schema };
+  });
+
+  const buttonSections = [];
+  for (let i = 1; i <= MAX_EDITOR_BUTTONS; i++) {
+    if (i > 1) {
+      const prev = c[`button${i - 1}`];
+      const filled =
+        prev && Object.values(prev).some((v) => v !== undefined && v !== null && v !== '' && v !== false);
+      if (!filled) break;
+    }
+    buttonSections.push(buttonSection(i, c[`button${i}`] || {}));
+  }
+
   return [
     { name: 'title', selector: { text: {} } },
-    {
-      name: 'pv',
-      type: 'expandable',
-      title: 'PV input (top-left)',
-      schema: [
-        { name: 'entity', selector: ENTITY_SELECTOR },
-        { name: 'name', selector: { text: {} } },
-        { name: 'icon', selector: { icon: {} } },
-      ],
-    },
-    {
-      name: 'grid',
-      type: 'expandable',
-      title: 'Grid input (top-right)',
-      schema: [
-        { name: 'entity', selector: ENTITY_SELECTOR },
-        { name: 'name', selector: { text: {} } },
-        { name: 'icon', selector: { icon: {} } },
-      ],
-    },
-    {
-      name: 'dc',
-      type: 'expandable',
-      title: 'DC output (bottom-left)',
-      schema: [
-        { name: 'entity', selector: ENTITY_SELECTOR },
-        { name: 'name', selector: { text: {} } },
-        { name: 'icon', selector: { icon: {} } },
-      ],
-    },
-    {
-      name: 'ac',
-      type: 'expandable',
-      title: 'AC output (bottom-right)',
-      schema: [
-        { name: 'entity', selector: ENTITY_SELECTOR },
-        { name: 'name', selector: { text: {} } },
-        { name: 'icon', selector: { icon: {} } },
-      ],
-    },
+    ...cornerSections,
     {
       name: 'unit',
       type: 'expandable',
@@ -1527,6 +2207,7 @@ function buildEditorSchema(config) {
       title: 'Options',
       schema: optionsSchema,
     },
+    ...buttonSections,
   ];
 }
 
@@ -1566,7 +2247,7 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
       const hint = document.createElement('div');
       hint.className = 'hint';
       hint.textContent =
-        'Every field is optional. Configured corners are clickable (opens the entity more-info dialog); unconfigured corners are hidden along with their flow line.';
+        'Every field is optional. Configured corners are clickable (opens the entity more-info dialog); unconfigured corners are hidden along with their flow line. Extra sensors go in the reading slots of a corner, and buttons go in the Button sections (or a buttons: list in YAML).';
       this.shadowRoot.appendChild(hint);
 
       const form = document.createElement('ha-form');
@@ -1575,7 +2256,10 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
 
       form.addEventListener('value-changed', (ev) => {
         ev.stopPropagation();
-        const newConfig = ev.detail && ev.detail.value ? ev.detail.value : {};
+        const raw = ev.detail && ev.detail.value ? ev.detail.value : {};
+        // Collapse the reading/button slots back into YAML arrays before the
+        // config leaves the editor.
+        const newConfig = formSlotsToConfig(raw);
         this._config = newConfig;
         this.dispatchEvent(
           new CustomEvent('config-changed', {
@@ -1615,14 +2299,16 @@ class IntegratedUpsFlowCardEditor extends HTMLElement {
     c.unit = unit;
     c.display = display;
 
-    return c;
+    // The form works with fixed reading/button slots; YAML stores arrays.
+    return configToFormSlots(c);
   }
 
   _render() {
     if (!this._form) return;
+    const data = configToFormSlots(this._config || {});
     this._form.hass = this._hass;
-    this._form.schema = buildEditorSchema(this._config || {});
-    this._form.data = this._config || {};
+    this._form.schema = buildEditorSchema(data);
+    this._form.data = data;
     this._form.computeLabel = (schema) => EDITOR_LABELS[schema.name] || schema.name;
     this._form.computeHelper = (schema) => EDITOR_HELPERS[schema.name] || undefined;
   }
